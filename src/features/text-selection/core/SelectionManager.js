@@ -9,6 +9,7 @@ import { pageEventBus } from '@/core/PageEventBus.js';
 import { SELECTION_EVENTS } from '@/features/text-selection/events/SelectionEvents.js';
 import settingsManager from '@/shared/managers/SettingsManager.js';
 import { SelectionTranslationMode } from '@/shared/config/config.js';
+import { walkOpenShadowTree } from '@/utils/dom/walkOpenShadowTree.js';
 
 /**
  * SelectionManager - Simplified text selection management
@@ -219,6 +220,23 @@ export class SelectionManager extends ResourceTracker {
           };
         }
 
+        const selectedText = selection.toString();
+        if (selectedText && typeof selection.getComposedRanges === 'function') {
+          const shadowRoots = this.getSelectionShadowRoots(selection);
+          const position = this.getComposedRangePosition(selection, shadowRoots);
+          if (position) return position;
+
+          const descendantRoots = this.getDescendantSelectionShadowRoots(selection);
+          const expandedRoots = new Set([...shadowRoots, ...descendantRoots]);
+          if (descendantRoots.length > 0) {
+            const expandedPosition = this.getComposedRangePosition(selection, [...expandedRoots], false, true);
+            if (expandedPosition) return expandedPosition;
+          } else if (shadowRoots.length === 0) {
+            const documentPosition = this.getComposedRangePosition(selection, shadowRoots, true);
+            if (documentPosition) return documentPosition;
+          }
+        }
+
         this.logger.debug('Position calculation failed: Empty rectangle and not input field', {
           rect: rect,
           activeElement: activeElement?.tagName,
@@ -243,6 +261,169 @@ export class SelectionManager extends ResourceTracker {
 
     } catch (error) {
       this.logger.error('Error calculating selection position:', error);
+      return null;
+    }
+  }
+
+  getSelectionShadowRoots(selection) {
+    const roots = new Set();
+    const addRoot = (node) => {
+      let root = node?.getRootNode?.();
+      while (root instanceof ShadowRoot && root.mode === 'open' && root.host.shadowRoot === root) {
+        roots.add(root);
+        root = root.host.getRootNode();
+      }
+    };
+
+    addRoot(selection.anchorNode);
+    addRoot(selection.focusNode);
+    for (const node of [selection.anchorNode, selection.focusNode, document.activeElement]) {
+      const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+      if (element?.shadowRoot?.mode === 'open') addRoot(element.shadowRoot);
+    }
+
+    return [...roots];
+  }
+
+  getDescendantSelectionShadowRoots(selection) {
+    const roots = new Set();
+    const scopes = new Set(
+      [selection.anchorNode, selection.focusNode]
+        .map((node) => node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement)
+        .filter(Boolean)
+    );
+    for (const scope of scopes) {
+      walkOpenShadowTree(scope, (element) => {
+        if (element.shadowRoot?.mode === 'open') roots.add(element.shadowRoot);
+      });
+    }
+
+    return [...roots];
+  }
+
+  getComposedRangePosition(selection, shadowRoots, allowDocumentRange = false, allowElementRange = false) {
+    let elementPosition = null;
+    for (const range of selection.getComposedRanges({ shadowRoots })) {
+      if (!range || range.collapsed || this.isExtensionUiRange(range) ||
+          !this.isComposedRangeForSelection(range, selection, shadowRoots, allowDocumentRange, allowElementRange)) continue;
+
+      const measurableRange = this.createRangeFromStaticRange(range);
+      if (!measurableRange) continue;
+
+      const rect = measurableRange.getBoundingClientRect();
+      if (!rect || !Number.isFinite(rect.left) || !Number.isFinite(rect.bottom) ||
+          !Number.isFinite(rect.width) || !Number.isFinite(rect.height) ||
+          (rect.width === 0 && rect.height === 0)) continue;
+
+      const iconSize = WindowsConfig.POSITIONING.ICON_SIZE || 32;
+      const isTopFrame = window === window.top;
+      const position = {
+        x: rect.left + rect.width / 2 - (iconSize / 2) + (isTopFrame ? window.scrollX : 0),
+        y: rect.bottom + (WindowsConfig.POSITIONING.SELECTION_OFFSET || 10) + (isTopFrame ? window.scrollY : 0),
+        _isViewportRelative: !isTopFrame
+      };
+      if (range.startContainer.nodeType === Node.TEXT_NODE && range.endContainer.nodeType === Node.TEXT_NODE) return position;
+      elementPosition ||= position;
+    }
+    return elementPosition;
+  }
+
+  isComposedRangeForSelection(range, selection, shadowRoots, allowDocumentRange, allowElementRange) {
+    const roots = new Set(shadowRoots);
+    const startRoot = range.startContainer.getRootNode();
+    const endRoot = range.endContainer.getRootNode();
+    if (startRoot === endRoot && roots.has(startRoot)) {
+      if (range.startContainer.nodeType === Node.TEXT_NODE && range.endContainer.nodeType === Node.TEXT_NODE) return true;
+
+      const anchorRoot = selection.anchorNode?.getRootNode();
+      const focusRoot = selection.focusNode?.getRootNode();
+      const matchesBoundaries = (startNode, startOffset, endNode, endOffset) =>
+        range.startContainer === startNode && range.startOffset === startOffset &&
+        range.endContainer === endNode && range.endOffset === endOffset;
+      const boundariesMatch = matchesBoundaries(selection.anchorNode, selection.anchorOffset, selection.focusNode, selection.focusOffset) ||
+        matchesBoundaries(selection.focusNode, selection.focusOffset, selection.anchorNode, selection.anchorOffset);
+      const containsNestedHost = this.rangeContainsNestedShadowHost(range, startRoot);
+
+      if (anchorRoot === startRoot && focusRoot === startRoot && boundariesMatch &&
+          !containsNestedHost) return true;
+
+      if (allowElementRange && anchorRoot === startRoot && focusRoot === startRoot && boundariesMatch &&
+          range.startContainer.nodeType === Node.ELEMENT_NODE && range.endContainer === range.startContainer &&
+          containsNestedHost && this.hasLightDomTextOutsideNestedHosts(
+            range.startContainer, startRoot, range.startOffset, range.endOffset
+          )) {
+        return true;
+      }
+      if (containsNestedHost) return false;
+
+      if (!allowElementRange || range.startContainer.nodeType !== Node.ELEMENT_NODE ||
+          range.endContainer !== range.startContainer || this.hasNestedShadowHost(range.startContainer, startRoot, roots)) return false;
+
+      if (anchorRoot !== startRoot || focusRoot !== startRoot) {
+        return range.startOffset === 0 && range.endOffset === range.startContainer.childNodes.length;
+      }
+
+      return boundariesMatch;
+    }
+
+    if (!allowDocumentRange || roots.size > 0 || startRoot !== document || endRoot !== document) return false;
+    const matchesBoundaries = (startNode, startOffset, endNode, endOffset) =>
+      range.startContainer === startNode && range.startOffset === startOffset &&
+      range.endContainer === endNode && range.endOffset === endOffset;
+
+    return matchesBoundaries(selection.anchorNode, selection.anchorOffset, selection.focusNode, selection.focusOffset) ||
+      matchesBoundaries(selection.focusNode, selection.focusOffset, selection.anchorNode, selection.anchorOffset);
+  }
+
+  hasNestedShadowHost(container, rangeRoot, roots) {
+    return [...roots].some((root) => root !== rangeRoot && container.contains(root.host));
+  }
+
+  rangeContainsNestedShadowHost(range, rangeRoot) {
+    const container = range.startContainer;
+    if (container.nodeType !== Node.ELEMENT_NODE || range.endContainer !== container) return false;
+    if (container.shadowRoot && container.shadowRoot !== rangeRoot) return true;
+
+    for (let index = range.startOffset; index < range.endOffset; index += 1) {
+      const child = container.childNodes[index];
+      if (child?.nodeType !== Node.ELEMENT_NODE) continue;
+      let hasNestedRoot = false;
+      walkOpenShadowTree(child, (element) => {
+        if (element.shadowRoot && element.shadowRoot !== rangeRoot) hasNestedRoot = true;
+      });
+      if (hasNestedRoot) return true;
+    }
+    return false;
+  }
+
+  hasLightDomTextOutsideNestedHosts(container, rangeRoot, startOffset, endOffset) {
+    const hasText = (node) => {
+      if (node.nodeType === Node.TEXT_NODE) return !!node.textContent?.trim();
+      if (node.nodeType !== Node.ELEMENT_NODE || (node.shadowRoot && node.shadowRoot !== rangeRoot)) return false;
+      return [...node.childNodes].some(hasText);
+    };
+    return [...container.childNodes].slice(startOffset, endOffset).some(hasText);
+  }
+
+  isExtensionUiRange(range) {
+    let node = range.startContainer;
+    while (node) {
+      const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+      if (element?.id && Object.values(UI_HOST_IDS).includes(element.id)) return true;
+      const root = node.getRootNode?.();
+      if (!(root instanceof ShadowRoot)) break;
+      node = root.host;
+    }
+    return false;
+  }
+
+  createRangeFromStaticRange(staticRange) {
+    try {
+      const range = document.createRange();
+      range.setStart(staticRange.startContainer, staticRange.startOffset);
+      range.setEnd(staticRange.endContainer, staticRange.endOffset);
+      return range;
+    } catch {
       return null;
     }
   }
