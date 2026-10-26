@@ -9,6 +9,8 @@ import { settingsManager } from '@/shared/managers/SettingsManager.js';
 import { INPUT_TYPES } from '@/shared/constants/detection.js';
 import { SelectionTranslationMode } from '@/shared/config/config.js';
 import { COMBINED_SELECTORS } from '@/shared/services/ElementDetectionConfig.js';
+import { MessageActions } from '@/shared/messaging/core/MessageActions.js';
+import { sendMessage } from '@/shared/messaging/core/UnifiedMessaging.js';
 
 const logger = getScopedLogger(LOG_COMPONENTS.TEXT_SELECTION, 'SimpleTextSelectionHandler');
 
@@ -19,6 +21,7 @@ const logger = getScopedLogger(LOG_COMPONENTS.TEXT_SELECTION, 'SimpleTextSelecti
 // the UI's shadow DOM. Any new pointerdown overwrites this context, so a
 // genuine outside click still dismisses immediately.
 const UI_INTERACTION_CONTEXT_MS = 1000;
+const TOOLBAR_RELEASE_FRESHNESS_MS = 1200;
 
 // Singleton instance for SimpleTextSelectionHandler
 let simpleTextSelectionHandlerInstance = null;
@@ -53,12 +56,6 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
     this.selectionTimeout = null;
     this.debounceDelay = 100; // 100ms debounce
 
-    // Timing for triple-click detection
-    this.tripleClickDelay = 300; // Wait time to detect triple-click
-
-    // Settings
-    this.enhancedTripleClickDrag = false; // Will be loaded from settings
-
     // Track Ctrl key state
     this.ctrlKeyPressed = false;
     this.lastKeyEventTime = 0;
@@ -72,10 +69,27 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
     this.isDragging = false;
     this.mouseDownTime = 0;
     this.lastMouseUpEvent = null;
+    this._selectionChangeVersion = 0;
+    this._primaryMouseDown = null;
+    this._lastReleasedPrimaryMouseDown = null;
+    this._primaryMouseInteractionSequence = 0;
+    this._lastMouseUpInteractionId = null;
+    this._lastSelectionInteractionId = null;
+    this._toolbarReleaseCandidate = null;
 
     // Diagnostic metadata captured synchronously during mouseup dispatch
     // (composedPath() is unreliable once dispatch has finished).
     this._lastMouseUpDiagnostics = null;
+    this._lastNativeClickContext = null;
+    this._lastSelectionRange = null;
+    this._lastSelectionTarget = null;
+    this._lastSelectionText = null;
+    this._selectionContinuationToken = null;
+    this._selectionContinuationText = null;
+    this._activeSelectionToken = null;
+    this._continuationClickIssued = false;
+    this._continuationSequence = 0;
+    this._continuationExpiryTimer = null;
 
     // Bounded interaction context: start of the latest pointer interaction,
     // classified read-only during the capture phase. { insideUi, timestamp }.
@@ -84,7 +98,6 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
     // Simplified triple-click + drag support
     this.lastTripleClickTime = 0;
     this.isWaitingForDragEnd = false;
-    this.dragStartTime = 0;
 
     // Smart selection preservation system
     this._preservationState = {
@@ -114,6 +127,7 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
     this.handleKeyUp = this.handleKeyUp.bind(this);
     this.handleMouseDown = this.handleMouseDown.bind(this);
     this.handleMouseUp = this.handleMouseUp.bind(this);
+    this.handleClick = this.handleClick.bind(this);
     this.handleUiPointerDownCapture = this.handleUiPointerDownCapture.bind(this);
     this.handleMouseMove = this.handleMouseMove.bind(this);
     this.handleInput = this.handleInput.bind(this);
@@ -159,6 +173,10 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
       // Start from a clean interaction context; never inherit stale state
       this._lastUiPointerInteraction = null;
       this._lastMouseUpDiagnostics = null;
+      this._primaryMouseDown = null;
+      this._lastReleasedPrimaryMouseDown = null;
+      this._toolbarReleaseCandidate = null;
+      this._clearSelectionContinuation();
 
       // If selectionManager already exists, clean it up first
       if (this.selectionManager) {
@@ -172,9 +190,6 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
 
       // Setup event listeners
       this.setupEventListeners();
-
-      // Load enhanced triple-click drag setting
-      this.enhancedTripleClickDrag = settingsManager.get('ENHANCED_TRIPLE_CLICK_DRAG', false);
 
       // Setup settings listeners
       this.setupSettingsListeners();
@@ -221,6 +236,10 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
       // 2.5 Clear interaction context so reactivation cannot inherit stale state
       this._lastUiPointerInteraction = null;
       this._lastMouseUpDiagnostics = null;
+      this._primaryMouseDown = null;
+      this._lastReleasedPrimaryMouseDown = null;
+      this._toolbarReleaseCandidate = null;
+      this._clearSelectionContinuation();
 
       // 3. Clean up settings listeners
       this._settingsListeners.forEach(unsubscribe => {
@@ -259,6 +278,7 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
     window.removeEventListener('pointerdown', this.handleUiPointerDownCapture, { capture: true });
     window.removeEventListener('mousedown', this.handleMouseDown, { critical: true });
     window.removeEventListener('mouseup', this.handleMouseUp, { critical: true });
+    window.removeEventListener('click', this.handleClick, { capture: true });
     window.removeEventListener('mousemove', this.handleMouseMove, { critical: true });
     window.removeEventListener('keydown', this.handleKeyDown);
     window.removeEventListener('keyup', this.handleKeyUp);
@@ -276,6 +296,26 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
     if (this._mouseUpAnimationFrame) cancelAnimationFrame(this._mouseUpAnimationFrame);
     this._clearPreservationTimer();
     this.cleanupTypingDetection();
+    this.isWaitingForDragEnd = false;
+    this._clearSelectionContinuation();
+  }
+
+  _clearSelectionContinuation() {
+    if (this._continuationExpiryTimer) clearTimeout(this._continuationExpiryTimer);
+    this._continuationExpiryTimer = null;
+    this._lastSelectionRange = null;
+    this._lastSelectionTarget = null;
+    this._lastSelectionText = null;
+    this._selectionContinuationToken = null;
+    this._selectionContinuationText = null;
+    this._activeSelectionToken = null;
+    this._continuationClickIssued = false;
+    window.__translateItPendingSelectionContinuationToken = null;
+  }
+
+  cleanup() {
+    this._clearSelectionContinuation();
+    super.cleanup();
   }
 
   setupEventListeners() {
@@ -298,6 +338,10 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
         critical: true
       });
       this.addEventListener(window, 'mouseup', this.handleMouseUp, {
+        critical: true
+      });
+      this.addEventListener(window, 'click', this.handleClick, {
+        capture: true,
         critical: true
       });
       this.addEventListener(window, 'mousemove', this.handleMouseMove, {
@@ -355,14 +399,6 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
           if (newValue === SelectionTranslationMode.ON_CLICK && this.selectionManager) {
             this.selectionManager.dismissWindow();
           }
-        }, 'simple-text-selection')
-      );
-
-      // ENHANCED_TRIPLE_CLICK_DRAG changes
-      this._settingsListeners.push(
-        settingsManager.onChange('ENHANCED_TRIPLE_CLICK_DRAG', (newValue) => {
-          logger.debug('ENHANCED_TRIPLE_CLICK_DRAG changed:', newValue);
-          this.enhancedTripleClickDrag = newValue;
         }, 'simple-text-selection')
       );
 
@@ -448,8 +484,7 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
     const currentTime = Date.now();
 
     // Enhanced triple-click + drag detection
-    if (this.enhancedTripleClickDrag &&
-        currentTime - this.lastTripleClickTime < 500 &&
+    if (currentTime - this.lastTripleClickTime < 500 &&
         this.isDragging) {
       return 'triple-click-drag';
     }
@@ -488,6 +523,7 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
    */
   handleSelectionChange() {
     if (!this.isActive || !this.selectionManager) return;
+    this._selectionChangeVersion += 1;
 
     // Clear existing timeout
     if (this.selectionTimeout) {
@@ -496,6 +532,7 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
 
     // If waiting for drag end after triple-click, don't process selection yet
     if (this.isWaitingForDragEnd) {
+      this.selectionTimeout = null;
       logger.debug('Waiting for drag end after triple-click, skipping selection processing');
       return;
     }
@@ -516,9 +553,19 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
       return;
     }
 
+    let restoreOwner = null;
     try {
       const selection = window.getSelection();
       const selectedText = selection ? selection.toString().trim() : '';
+      const currentRange = selection?.rangeCount && typeof selection.getRangeAt === 'function'
+        ? selection.getRangeAt(0)
+        : null;
+      const currentRangeSnapshot = currentRange?.cloneRange?.() ?? currentRange;
+      const pendingRestoreOwner = this._lastReleasedPrimaryMouseDown;
+      if (pendingRestoreOwner?.restoreConsumed && pendingRestoreOwner.restoreInProgress &&
+          pendingRestoreOwner.selectionInteractionId === this._lastSelectionInteractionId &&
+          selectedText === this._lastSelectionText && currentRange && this._lastSelectionRange &&
+          this._isSameRange(currentRange, this._lastSelectionRange)) return;
 
       logger.debug('Processing selection', {
         hasText: !!selectedText,
@@ -637,6 +684,39 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
         return;
       }
 
+      let pendingDisplayRestore = null;
+      const releasedInteraction = this._lastReleasedPrimaryMouseDown;
+      const isUnchangedPriorSelection = selectedText === this._lastSelectionText && currentRange &&
+        this._lastSelectionRange && this._isSameRange(currentRange, this._lastSelectionRange);
+      if (releasedInteraction && !releasedInteraction.restoreConsumed && isUnchangedPriorSelection &&
+          releasedInteraction.selectionInteractionId === this._lastSelectionInteractionId) {
+        releasedInteraction.restoreConsumed = true;
+        releasedInteraction.restoreInProgress = true;
+        restoreOwner = releasedInteraction;
+        let restoreResult = null;
+        try {
+          restoreResult = await releasedInteraction.invalidationResult;
+        } catch {
+          // An unavailable owner response never authorizes display recovery.
+        }
+        const latestSelection = window.getSelection();
+        const latestRange = latestSelection?.rangeCount && typeof latestSelection.getRangeAt === 'function'
+          ? latestSelection.getRangeAt(0)
+          : null;
+        if (!this.isActive || this.isDragging || this._lastReleasedPrimaryMouseDown !== releasedInteraction ||
+            this._lastSelectionInteractionId !== releasedInteraction.selectionInteractionId ||
+            latestSelection?.toString().trim() !== selectedText || !latestRange ||
+            !this._isSameRange(latestRange, currentRangeSnapshot)) return;
+        if (restoreResult?.valid === true && restoreResult.cancelledPendingDisplay === true &&
+            restoreResult.canRestore === true && Number.isInteger(restoreResult.requestVersion)) {
+          pendingDisplayRestore = {
+            canRestore: true,
+            requestVersion: restoreResult.requestVersion,
+            selectionInteractionId: releasedInteraction.selectionInteractionId,
+          };
+        }
+      }
+
       this._startSelectionPreservation(selectionType);
 
       // Process the selection
@@ -649,10 +729,50 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
         });
         
         // Pass the keyboard state to selection manager
-        await this.selectionManager.processSelection(selectedText, selection, {
+        const continuationToken = this._selectionContinuationToken;
+        const toolbarPosition = this._consumeToolbarReleasePosition(
+          selectedText,
+          continuationToken,
+          currentRange,
+          !!pendingDisplayRestore,
+        );
+        const selectionUnchanged = selectedText === this._lastSelectionText && currentRange &&
+          this._lastSelectionRange && this._isSameRange(currentRange, this._lastSelectionRange);
+        const samePriorSelection = selectionUnchanged &&
+          this._isRelatedSelectionTarget(this._lastSelectionTarget, this.lastMouseUpEvent?.target);
+        const originToken = continuationToken ||
+          (samePriorSelection ? this._activeSelectionToken : null) || this._newSelectionToken();
+        const displayInteraction = this._getDisplayInteraction(selectionType, selection);
+        this._selectionContinuationToken = null;
+        this._selectionContinuationText = null;
+        const displayed = await this.selectionManager.processSelection(selectedText, selection, {
           ctrlPressed: this.ctrlKeyPressed,
-          shiftPressed: this.shiftKeyPressed
+          shiftPressed: this.shiftKeyPressed,
+          ...(this._lastSelectionInteractionId !== null && (!selectionUnchanged || continuationToken || pendingDisplayRestore)
+            ? { selectionInteractionId: this._lastSelectionInteractionId }
+            : {}),
+          ...(pendingDisplayRestore ? { pendingDisplayRestore } : {}),
+          ...(toolbarPosition ? { toolbarPosition } : {}),
+          ...(originToken ? { selectionContinuationToken: originToken } : {}),
+          ...(displayInteraction ? { displayInteraction } : {})
         });
+        if (displayed && selection?.rangeCount && typeof selection.getRangeAt === 'function') {
+          this._activeSelectionToken = originToken;
+          this._continuationClickIssued = false;
+          this._lastSelectionRange = selection.getRangeAt(0).cloneRange();
+          this._lastSelectionTarget = this.lastMouseUpEvent?.target || null;
+          this._lastSelectionText = selectedText;
+        } else if (!selectionUnchanged) {
+          this._lastSelectionRange = null;
+          this._lastSelectionText = null;
+          this._lastSelectionTarget = null;
+          this._activeSelectionToken = null;
+          this._continuationClickIssued = false;
+        } else if (!samePriorSelection) {
+          this._lastSelectionTarget = null;
+          this._activeSelectionToken = null;
+          this._continuationClickIssued = false;
+        }
       } else {
         logger.warn('SelectionManager is null - this should not happen with critical protection');
       }
@@ -669,6 +789,8 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
       } catch (handlerError) {
         logger.error('ErrorHandler not available when processing selection:', handlerError);
       }
+    } finally {
+      if (restoreOwner) restoreOwner.restoreInProgress = false;
     }
   }
 
@@ -931,6 +1053,12 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
    */
   handleKeyDown(event) {
     this.lastKeyEventTime = Date.now();
+    this._clearSelectionContinuation();
+    if (this.isWaitingForDragEnd && !this.isDragging) this.isWaitingForDragEnd = false;
+    this._primaryMouseDown = null;
+    this._lastReleasedPrimaryMouseDown = null;
+    this._lastSelectionInteractionId = null;
+    this._toolbarReleaseCandidate = null;
 
     // A keyboard interaction originating outside extension UI refutes any
     // recent inside-UI pointer context, so keyboard-driven selection clearing
@@ -1042,9 +1170,62 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
    * Handle mouse down - start drag detection with triple-click support
    */
   handleMouseDown(event) {
+    const eligibleSelectionInteraction = event.isTrusted === true && event.button === 0 && !event.shiftKey &&
+      this._classifyComposedPath(event) !== true;
+    let invalidationResult = null;
+    if (eligibleSelectionInteraction) {
+      const timestamp = Date.now();
+      const windowsManager = this.getWindowsManager();
+      invalidationResult = windowsManager?.invalidatePendingShows(timestamp) ?? null;
+
+      let crossOriginTop = false;
+      try {
+        if (window !== window.top) {
+          try {
+            const topWindowsManager = window.top.windowsManagerInstance;
+            if (topWindowsManager && topWindowsManager !== windowsManager) {
+              invalidationResult = topWindowsManager.invalidatePendingShows(timestamp);
+            }
+          } catch {
+            crossOriginTop = true;
+          }
+        }
+      } catch {
+        crossOriginTop = true;
+      }
+
+      if (crossOriginTop) {
+        invalidationResult = sendMessage({
+          action: MessageActions.INVALIDATE_PENDING_DISPLAY,
+          data: { timestamp },
+        }, { silent: true }).then((response) => response?.success === true ? response.result : null)
+          .catch(() => null);
+      }
+    }
+
+    if (this._continuationExpiryTimer) clearTimeout(this._continuationExpiryTimer);
+    this._continuationExpiryTimer = null;
+    window.__translateItPendingSelectionContinuationToken = null;
+    this._selectionContinuationToken = null;
+    this._selectionContinuationText = null;
+    this._lastNativeClickContext = null;
     this.lastMouseEventTime = Date.now();
+    this._lastMouseUpInteractionId = null;
+    this._lastReleasedPrimaryMouseDown = null;
+    this._lastSelectionInteractionId = null;
     this.isDragging = true;
     this.mouseDownTime = Date.now();
+    const currentSelection = window.getSelection()?.toString().trim() || '';
+    this._primaryMouseDown = event.button === 0 ? {
+      interactionId: ++this._primaryMouseInteractionSequence,
+      selectionInteractionId: eligibleSelectionInteraction ? this._primaryMouseInteractionSequence : null,
+      invalidationResult: eligibleSelectionInteraction ? Promise.resolve(invalidationResult) : null,
+      restoreConsumed: false,
+      restoreInProgress: false,
+      selectionChangeVersion: this._selectionChangeVersion,
+      selectedText: currentSelection
+    } : null;
+    this._toolbarReleaseCandidate = null;
 
     // Update modifier states from mouse event (Sync both TRUE and FALSE states)
     this.ctrlKeyPressed = event.ctrlKey || event.metaKey;
@@ -1054,20 +1235,18 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
       this.lastKeyEventTime = Date.now();
     }
 
-    // Simple triple-click detection (only if enhanced mode is enabled)
-    if (this.enhancedTripleClickDrag) {
-      const currentTime = Date.now();
-      const timeSinceLastClick = currentTime - this.lastTripleClickTime;
+    // Track consecutive clicks to preserve the final expanded selection.
+    let detectedTripleClick = false;
+    const currentTime = Date.now();
+    const timeSinceLastClick = currentTime - this.lastTripleClickTime;
 
-      // Check if this is a triple-click (within 300ms)
-      if (timeSinceLastClick < 300 && timeSinceLastClick > 0) {
-        this.isWaitingForDragEnd = true;
-        this.dragStartTime = currentTime;
-        logger.debug('Triple-click detected - waiting for drag end');
-      }
-
-      this.lastTripleClickTime = currentTime;
+    if (timeSinceLastClick < 300 && timeSinceLastClick > 0) {
+      detectedTripleClick = true;
+      this.isWaitingForDragEnd = true;
+      logger.debug('Multi-click selection detected - waiting for drag end');
     }
+    this.lastTripleClickTime = currentTime;
+    if (!detectedTripleClick) this.isWaitingForDragEnd = false;
   }
 
   /**
@@ -1078,12 +1257,97 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
     // We only care about mouse up to end the drag
   }
 
+  handleClick(event) {
+    this._lastNativeClickContext = null;
+    if (event?.button !== 0 || !Number.isInteger(event.detail) || event.detail <= 1 ||
+        this._lastMouseUpInteractionId === null ||
+        !this._isRelatedSelectionTarget(this.lastMouseUpEvent?.target, event.target)) return;
+
+    const selection = window.getSelection();
+    if (!selection?.toString().trim() || !selection.rangeCount || typeof selection.getRangeAt !== 'function') return;
+    let range;
+    try {
+      range = selection.getRangeAt(0).cloneRange();
+    } catch {
+      return;
+    }
+    this._lastNativeClickContext = {
+      detail: event.detail,
+      target: event.target,
+      range,
+      text: selection.toString().trim(),
+      timestamp: Date.now(),
+      interactionId: this._lastMouseUpInteractionId,
+      selectionChangeVersion: this._selectionChangeVersion,
+    };
+  }
+
+  _getDisplayInteraction(selectionType, selection = null) {
+    const click = this._lastNativeClickContext;
+    if (selectionType === 'keyboard-selection') {
+      this._lastNativeClickContext = null;
+      return selectionType;
+    }
+    if (click?.detail > 1) {
+      const currentRange = selection?.rangeCount && typeof selection.getRangeAt === 'function'
+        ? selection.getRangeAt(0)
+        : null;
+      const versionDelta = this._selectionChangeVersion - click.selectionChangeVersion;
+      const clickMatchesSelection = currentRange && click.text === selection.toString().trim() &&
+        this._isSameRange(currentRange, click.range);
+      const clickMatchesInteraction = click.interactionId === this._lastMouseUpInteractionId &&
+        this._isRelatedSelectionTarget(this.lastMouseUpEvent?.target, click.target);
+      const selectionChangeOrderMatches = versionDelta === 0 || versionDelta === 1;
+      const isFresh = Date.now() - click.timestamp < 500;
+      this._lastNativeClickContext = null;
+      if (clickMatchesSelection && clickMatchesInteraction && selectionChangeOrderMatches && isFresh) {
+        return 'multi-click';
+      }
+      return null;
+    }
+    this._lastNativeClickContext = null;
+    if (['regular-drag', 'shift-click', 'post-drag-selection'].includes(selectionType) &&
+        this._isRecentMouseSelection(selection)) {
+      return selectionType;
+    }
+    return null;
+  }
+
+  _isRecentMouseSelection(selection) {
+    const target = this.lastMouseUpEvent?.target;
+    const anchor = selection?.anchorNode;
+    const anchorElement = anchor?.nodeType === Node.TEXT_NODE ? anchor.parentElement : anchor;
+    return !!(target && anchorElement && Date.now() - this.lastMouseEventTime < 500 &&
+      this._isRelatedSelectionTarget(target, anchorElement));
+  }
+
   /**
    * Handle mouse up - end drag detection and process selection if needed
    */
   handleMouseUp(event) {
     this.lastMouseEventTime = Date.now();
     this.lastMouseUpEvent = event; // Store for translation window detection
+    const mouseDown = this._primaryMouseDown;
+    this._primaryMouseDown = null;
+    this._lastReleasedPrimaryMouseDown = event.button === 0 ? mouseDown : null;
+    this._lastMouseUpInteractionId = event.button === 0 ? mouseDown?.interactionId ?? null : null;
+    this._lastSelectionInteractionId = event.button === 0
+      ? mouseDown?.selectionInteractionId ?? null
+      : null;
+    const currentSelection = window.getSelection()?.toString().trim() || '';
+    this._toolbarReleaseCandidate = event.button === 0 && mouseDown &&
+      Number.isFinite(event.clientX) && Number.isFinite(event.clientY)
+      ? {
+          interactionId: mouseDown.interactionId,
+          selectionInteractionId: mouseDown.selectionInteractionId,
+          x: event.clientX,
+          y: event.clientY,
+          timestamp: Date.now(),
+          selectionChangeVersion: mouseDown.selectionChangeVersion,
+          selectedTextAtRelease: currentSelection,
+          selectedTextAtPress: mouseDown.selectedText
+        }
+      : null;
     this._lastMouseUpDiagnostics = {
       timestamp: this.lastMouseEventTime,
       composedPathHasUi: this._classifyComposedPath(event)
@@ -1120,29 +1384,167 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
     const delay = wasShiftClick ? 150 : 50; // Longer delay for Shift+Click to allow browser to complete selection
 
     this._mouseUpAnimationFrame = requestAnimationFrame(() => {
-      this._mouseUpTimeout = setTimeout(() => {
-        const selection = window.getSelection();
-        if (selection && selection.toString().trim()) {
-          // Enhanced preservation for post-mouseup scenarios
-          const selectionType = this._detectSelectionType();
-          if (selectionType === 'triple-click-drag' || wasShiftClick) {
-            // Start preservation immediately for critical scenarios
-            this._startSelectionPreservation(selectionType);
+      this._mouseUpTimeout = setTimeout(async () => {
+        try {
+          const selection = window.getSelection();
+          if (selection && selection.toString().trim()) {
+            // Enhanced preservation for post-mouseup scenarios
+            const selectionType = this._detectSelectionType();
+            if (selectionType === 'triple-click-drag' || wasShiftClick) {
+              // Start preservation immediately for critical scenarios
+              this._startSelectionPreservation(selectionType);
+            }
+
+            logger.debug('Processing selection after drag end', {
+              wasShiftClick,
+              selectionType,
+              hasPreservation: this._isPreservationActive()
+            });
+            await this.processSelection();
           }
-
-          logger.debug('Processing selection after drag end', {
-            wasShiftClick,
-            selectionType,
-            hasPreservation: this._isPreservationActive()
-          });
-          this.processSelection();
+        } catch (error) {
+          logger.error('Error processing selection after mouseup:', error);
+        } finally {
+          // The triple-click hold only protects the active pointer drag. Once
+          // mouseup processing completes or fails, later selections proceed.
+          this.isWaitingForDragEnd = false;
+          this._mouseUpTimeout = null;
+          this._mouseUpAnimationFrame = null;
         }
-
-        // Clean up references
-        this._mouseUpTimeout = null;
-        this._mouseUpAnimationFrame = null;
       }, delay);
     });
+  }
+
+  getSelectionContinuationTokenForClick(event) {
+    if (event?.button !== 0 || ![1, 2, 3].includes(event?.detail)) {
+      this._clearSelectionContinuation();
+      window.__translateItPendingSelectionContinuationToken = null;
+      return null;
+    }
+    if (event.detail !== 3) {
+      window.__translateItPendingSelectionContinuationToken = null;
+      const current = window.getSelection();
+      const currentRange = current?.rangeCount && typeof current.getRangeAt === 'function'
+        ? current.getRangeAt(0)
+        : null;
+      const selectionUnchanged = currentRange && this._lastSelectionRange &&
+        this._isSameRange(currentRange, this._lastSelectionRange) &&
+        this._isRelatedSelectionTarget(this._lastSelectionTarget, event.target);
+      if (this._activeSelectionToken && !selectionUnchanged) {
+        if (this._continuationExpiryTimer) clearTimeout(this._continuationExpiryTimer);
+        this._continuationExpiryTimer = setTimeout(() => this._clearSelectionContinuation(), 500);
+      }
+      return null;
+    }
+    if (this._continuationExpiryTimer) clearTimeout(this._continuationExpiryTimer);
+    this._continuationExpiryTimer = null;
+    const selection = window.getSelection();
+    const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+    const frameId = window.iframeClickManager?.crossFrameManager?.frameId ||
+      window.windowsManagerInstance?.crossFrameManager?.frameId;
+    const isExpansion = !!(
+      selection?.toString().trim() && range && this._lastSelectionRange &&
+      !this._continuationClickIssued && this._activeSelectionToken && frameId === this._activeSelectionToken.originFrameId &&
+      this._isRelatedSelectionTarget(this._lastSelectionTarget, event.target) &&
+      this._isExpandedRange(range, this._lastSelectionRange)
+    );
+    if (!isExpansion) {
+      if (!range || !this._lastSelectionRange ||
+          !this._isSameRange(range, this._lastSelectionRange) ||
+          !this._isRelatedSelectionTarget(this._lastSelectionTarget, event.target)) {
+        this._clearSelectionContinuation();
+      }
+      return null;
+    }
+
+    this._selectionContinuationToken = this._activeSelectionToken;
+    this._selectionContinuationText = selection.toString().trim();
+    this._continuationClickIssued = true;
+    window.__translateItPendingSelectionContinuationToken = this._activeSelectionToken;
+    if (this._continuationExpiryTimer) clearTimeout(this._continuationExpiryTimer);
+    const token = this._activeSelectionToken;
+    this._continuationExpiryTimer = setTimeout(() => {
+      if (window.__translateItPendingSelectionContinuationToken === token) {
+        window.__translateItPendingSelectionContinuationToken = null;
+      }
+      this._continuationExpiryTimer = null;
+    }, 500);
+    return token;
+  }
+
+  _isSameRange(first, second) {
+    try {
+      return first.compareBoundaryPoints(Range.START_TO_START, second) === 0 &&
+        first.compareBoundaryPoints(Range.END_TO_END, second) === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  _newSelectionToken() {
+    const originFrameId = window.iframeClickManager?.crossFrameManager?.frameId ||
+      window.windowsManagerInstance?.crossFrameManager?.frameId;
+    return originFrameId ? { originFrameId, sequence: ++this._continuationSequence } : null;
+  }
+
+  _isExpandedRange(nextRange, previousRange) {
+    try {
+      const startsEarlierOrEqual = nextRange.compareBoundaryPoints(Range.START_TO_START, previousRange) <= 0;
+      const endsLaterOrEqual = nextRange.compareBoundaryPoints(Range.END_TO_END, previousRange) >= 0;
+      const changed = nextRange.compareBoundaryPoints(Range.START_TO_START, previousRange) !== 0 ||
+        nextRange.compareBoundaryPoints(Range.END_TO_END, previousRange) !== 0;
+      return startsEarlierOrEqual && endsLaterOrEqual && changed;
+    } catch {
+      return false;
+    }
+  }
+
+  _isRelatedSelectionTarget(previousTarget, nextTarget) {
+    if (!previousTarget || !nextTarget) return false;
+    if (previousTarget === nextTarget) return true;
+    try {
+      return previousTarget.contains(nextTarget) || nextTarget.contains(previousTarget);
+    } catch {
+      return false;
+    }
+  }
+
+  _consumeToolbarReleasePosition(selectedText, continuationToken = null, currentRange = null, allowUnchangedRecovery = false) {
+    const candidate = this._toolbarReleaseCandidate;
+    if (!candidate) return null;
+
+    const verifiedContinuation = continuationToken &&
+      continuationToken === this._activeSelectionToken &&
+      continuationToken === this._selectionContinuationToken &&
+      selectedText === this._selectionContinuationText;
+    const independentSameTextSelection = selectedText === candidate.selectedTextAtPress &&
+      Number.isInteger(candidate.selectionInteractionId) &&
+      candidate.selectionInteractionId === this._lastSelectionInteractionId &&
+      currentRange && this._lastSelectionRange &&
+      !this._isSameRange(currentRange, this._lastSelectionRange);
+    const restoredSameRange = allowUnchangedRecovery && selectedText === this._lastSelectionText &&
+      selectedText === candidate.selectedTextAtPress && selectedText === candidate.selectedTextAtRelease &&
+      currentRange && this._lastSelectionRange && this._isSameRange(currentRange, this._lastSelectionRange);
+    const validCandidate = Date.now() - candidate.timestamp <= TOOLBAR_RELEASE_FRESHNESS_MS &&
+      Number.isInteger(candidate.interactionId) &&
+      candidate.interactionId === this._lastMouseUpInteractionId &&
+      Number.isFinite(candidate.x) && Number.isFinite(candidate.y) && !!selectedText &&
+      (verifiedContinuation || restoredSameRange || (
+        candidate.selectionChangeVersion !== this._selectionChangeVersion &&
+        (selectedText !== candidate.selectedTextAtPress || independentSameTextSelection) &&
+        (!candidate.selectedTextAtRelease || candidate.selectedTextAtRelease === selectedText)
+      ));
+    this._toolbarReleaseCandidate = null;
+    if (!validCandidate) return null;
+
+    const isTopFrame = window === window.top;
+    const scrollX = isTopFrame ? window.scrollX : 0;
+    const scrollY = isTopFrame ? window.scrollY : 0;
+    return {
+      x: candidate.x + scrollX,
+      y: candidate.y + 10 + scrollY,
+      _isViewportRelative: !isTopFrame
+    };
   }
 
   /**
@@ -1378,6 +1780,7 @@ export class SimpleTextSelectionHandler extends ResourceTracker {
   }
 
   destroy() {
+    this._clearSelectionContinuation();
     // Clean up preservation system
     this._clearPreservationTimer();
 

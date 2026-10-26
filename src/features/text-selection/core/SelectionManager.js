@@ -39,6 +39,7 @@ export class SelectionManager extends ResourceTracker {
     // Simple state tracking - no complex drag detection
     this.lastProcessedText = null;
     this.lastProcessedTime = 0;
+    this.lastProcessedSelectionInteractionId = null;
     this.processingCooldown = 1000; // 1 second to prevent duplicates
 
     // Generate frameId for cross-frame communication
@@ -111,16 +112,43 @@ export class SelectionManager extends ResourceTracker {
     // 1. Emit global selection event (Coordinator Pattern)
     // This allows any module (like FAB or TTS) to react independently
     const selectionTranslationMode = settingsManager.get('selectionTranslationMode', SelectionTranslationMode.ON_CLICK);
+    const {
+      toolbarPosition,
+      selectionContinuationToken,
+      displayInteraction,
+      selectionInteractionId,
+      ...selectionOptions
+    } = options;
+    const suppressWindowsManagerDisplay = this.isDuplicateSelection(
+      selectedText,
+      Date.now(),
+      selectionInteractionId,
+    );
+    if (selectionContinuationToken && window === window.top) {
+      window.__translateItSelectionDisplayToken = selectionContinuationToken;
+    }
+    if (displayInteraction && window === window.top) {
+      window.__translateItSelectionDisplayInteraction = displayInteraction;
+    }
     pageEventBus.emit(SELECTION_EVENTS.GLOBAL_SELECTION_CHANGE, {
       text: selectedText,
       position: position,
+      ...(toolbarPosition ? { toolbarPosition } : {}),
       mode: selectionTranslationMode,
-      options: options, // Pass keyboard state (ctrlPressed, shiftPressed)
+      options: selectionOptions, // Pass keyboard state (ctrlPressed, shiftPressed)
+      ...(selectionInteractionId != null ? { selectionInteractionId } : {}),
+      ...(suppressWindowsManagerDisplay ? { suppressWindowsManagerDisplay: true } : {}),
       context: {
         frameId: this.frameId,
         isIframe: window !== window.top
       }
     });
+    if (window.__translateItSelectionDisplayToken === selectionContinuationToken) {
+      window.__translateItSelectionDisplayToken = null;
+    }
+    if (window.__translateItSelectionDisplayInteraction === displayInteraction) {
+      window.__translateItSelectionDisplayInteraction = null;
+    }
 
     // 2. Check if we should skip showing our own UI (WindowsManager)
     const isTextSelectionEnabled = settingsManager.get('TRANSLATE_ON_TEXT_SELECTION', true);
@@ -149,11 +177,11 @@ export class SelectionManager extends ResourceTracker {
     const currentTime = Date.now();
 
     // Prevent duplicate processing of same text for the UI display part
-    if (this.isDuplicateSelection(selectedText, currentTime)) {
+    if (this.isDuplicateSelection(selectedText, currentTime, selectionInteractionId)) {
       this.logger.debug('Skipping duplicate selection UI display', {
         text: selectedText.substring(0, 30) + '...'
       });
-      return;
+      return false;
     }
 
     this.logger.debug('Processing new selection for UI', {
@@ -162,18 +190,28 @@ export class SelectionManager extends ResourceTracker {
     });
 
     // Show translation UI (This part is still dependent on WindowsManager being allowed)
-    await this.showTranslationUI(selectedText, position);
+    await this.showTranslationUI(selectedText, position, {
+      ...selectionOptions,
+      ...(selectionInteractionId != null ? { selectionInteractionId } : {}),
+      ...(selectionContinuationToken ? { selectionContinuationToken } : {}),
+      ...(displayInteraction ? { displayInteraction } : {})
+    }, toolbarPosition);
 
     // Track this selection
     this.lastProcessedText = selectedText;
     this.lastProcessedTime = currentTime;
+    this.lastProcessedSelectionInteractionId = selectionInteractionId ?? null;
+    return true;
   }
 
   /**
    * Check if this is a duplicate selection
    */
-  isDuplicateSelection(selectedText, currentTime) {
+  isDuplicateSelection(selectedText, currentTime, selectionInteractionId = null) {
     if (!selectedText || !this.lastProcessedText) return false;
+
+    if (selectionInteractionId != null &&
+        selectionInteractionId !== this.lastProcessedSelectionInteractionId) return false;
 
     const isSameText = selectedText === this.lastProcessedText;
     const withinCooldown = (currentTime - this.lastProcessedTime) < this.processingCooldown;
@@ -431,7 +469,7 @@ export class SelectionManager extends ResourceTracker {
   /**
    * Show translation UI (icon or window based on settings)
    */
-  async showTranslationUI(selectedText, position, options = {}) {
+  async showTranslationUI(selectedText, position, options = {}, toolbarPosition = null) {
     // Note: We no longer call WindowsManager.show() directly here.
     // The GLOBAL_SELECTION_CHANGE event emitted in processSelection() 
     // triggers all UI managers independently (Decoupled Architecture).
@@ -445,20 +483,21 @@ export class SelectionManager extends ResourceTracker {
         textLength: selectedText.length
       });
 
-      this.requestWindowCreationInMainFrame(selectedText, position, options);
+      this.requestWindowCreationInMainFrame(selectedText, position, options, toolbarPosition);
     }
   }
 
   /**
    * Request window creation in main frame (for iframe context)
    */
-  requestWindowCreationInMainFrame(selectedText, position, options = {}) {
+  requestWindowCreationInMainFrame(selectedText, position, options = {}, toolbarPosition = null) {
     try {
       const message = {
         type: WindowsConfig.CROSS_FRAME.TEXT_SELECTION_WINDOW_REQUEST,
         frameId: this.frameId,
         selectedText: selectedText,
         position: position,
+        ...(toolbarPosition ? { toolbarPosition } : {}),
         options: options, // Pass keyboard state
         timestamp: Date.now()
       };
@@ -487,6 +526,7 @@ export class SelectionManager extends ResourceTracker {
     // Clear tracking
     this.lastProcessedText = null;
     this.lastProcessedTime = 0;
+    this.lastProcessedSelectionInteractionId = null;
   }
 
   /**
@@ -513,6 +553,7 @@ export class SelectionManager extends ResourceTracker {
   cleanup() {
     this.lastProcessedText = null;
     this.lastProcessedTime = 0;
+    this.lastProcessedSelectionInteractionId = null;
 
     // Call parent cleanup
     super.cleanup();

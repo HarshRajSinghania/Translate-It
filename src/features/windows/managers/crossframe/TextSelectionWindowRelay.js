@@ -113,7 +113,9 @@ export class TextSelectionWindowRelay {
   _handleMessage(event) {
     const data = event.data;
 
-    if (!data || typeof data !== 'object' || data.type !== WindowsConfig.CROSS_FRAME.TEXT_SELECTION_WINDOW_REQUEST) {
+    if (!data || typeof data !== 'object') return;
+
+    if (data.type !== WindowsConfig.CROSS_FRAME.TEXT_SELECTION_WINDOW_REQUEST) {
       return;
     }
 
@@ -140,7 +142,14 @@ export class TextSelectionWindowRelay {
       return;
     }
 
-    const forwarded = { ...data, position: adjustedPosition };
+    const adjustedToolbarPosition = data.toolbarPosition
+      ? adjustForDirectChild(event.source, data.toolbarPosition)
+      : null;
+    const forwarded = {
+      ...data,
+      position: adjustedPosition,
+      ...(adjustedToolbarPosition ? { toolbarPosition: adjustedToolbarPosition } : {})
+    };
     window.parent.postMessage(forwarded, '*');
     logger.debug('Forwarded text selection window request to parent frame');
   }

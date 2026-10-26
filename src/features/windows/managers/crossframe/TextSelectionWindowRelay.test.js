@@ -134,12 +134,17 @@ describe('TextSelectionWindowRelay', () => {
       relay._isTopFrame = false;
 
       const sourceWindow = { iframe: true };
+      const continuationToken = { originFrameId: 'leaf-click-frame', sequence: 3 };
       stubIframes([{
         contentWindow: sourceWindow,
         getBoundingClientRect: () => ({ left: 150, top: 300 })
       }]);
 
-      relay._handleMessage(requestMessage({ frameId: 'leaf' }, sourceWindow));
+      relay._handleMessage(requestMessage({
+        frameId: 'leaf',
+        toolbarPosition: { x: 25, y: 35, _isViewportRelative: true },
+        options: { selectionContinuationToken: continuationToken }
+      }, sourceWindow));
 
       expect(parentPostMessage).toHaveBeenCalledTimes(1);
       const [forwarded, target] = parentPostMessage.mock.calls[0];
@@ -152,6 +157,13 @@ describe('TextSelectionWindowRelay', () => {
         _isViewportRelative: true,
         _isAbsolute: false
       });
+      expect(forwarded.toolbarPosition).toEqual({
+        x: 175,
+        y: 335,
+        _isViewportRelative: true,
+        _isAbsolute: false
+      });
+      expect(forwarded.options).toEqual({ selectionContinuationToken: continuationToken });
       relay.destroy();
     });
 
@@ -177,9 +189,20 @@ describe('TextSelectionWindowRelay', () => {
       relay._handleMessage({ data: { type: 'OTHER' } });
       relay._handleMessage({ data: { type: REQUEST, selectedText: '', position: { x: 1, y: 1 } } });
       relay._handleMessage({ data: null });
+      relay._handleMessage({ data: { type: 'translateit-invalidate-pending-display', timestamp: Date.now() } });
 
       expect(parentPostMessage).not.toHaveBeenCalled();
       relay.destroy();
+
+      const top = new TextSelectionWindowRelay();
+      const sink = vi.fn();
+      top.setSink(sink);
+      top._handleMessage({
+        data: { type: 'translateit-invalidate-pending-display', timestamp: Date.now() },
+        source: { forgedChild: true },
+      });
+      expect(sink).not.toHaveBeenCalled();
+      top.destroy();
     });
 
     it('accumulates offsets across a two-hop chain into the top frame', () => {
@@ -191,7 +214,11 @@ describe('TextSelectionWindowRelay', () => {
         contentWindow: childB,
         getBoundingClientRect: () => ({ left: 50, top: 80 })
       }]);
-      intermediate._handleMessage(requestMessage({ frameId: 'leaf', position: { x: 10, y: 20 } }, childB));
+      intermediate._handleMessage(requestMessage({
+        frameId: 'leaf',
+        position: { x: 10, y: 20 },
+        toolbarPosition: { x: 15, y: 25, _isViewportRelative: true }
+      }, childB));
 
       const [forwarded] = parentPostMessage.mock.calls[0];
 
@@ -201,7 +228,8 @@ describe('TextSelectionWindowRelay', () => {
         deliveries.push({
           data,
           source,
-          position: adjustForDirectChild(source, data.position) ?? { ...data.position }
+          position: adjustForDirectChild(source, data.position) ?? { ...data.position },
+          toolbarPosition: adjustForDirectChild(source, data.toolbarPosition) ?? { ...data.toolbarPosition }
         });
       });
 
@@ -215,6 +243,12 @@ describe('TextSelectionWindowRelay', () => {
       expect(deliveries[0].position).toEqual({
         x: 10 + 50 + 200,
         y: 20 + 80 + 300,
+        _isViewportRelative: true,
+        _isAbsolute: false
+      });
+      expect(deliveries[0].toolbarPosition).toEqual({
+        x: 15 + 50 + 200,
+        y: 25 + 80 + 300,
         _isViewportRelative: true,
         _isAbsolute: false
       });

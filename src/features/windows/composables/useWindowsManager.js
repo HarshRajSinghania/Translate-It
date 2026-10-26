@@ -86,15 +86,29 @@ export function useWindowsManager() {
 
     logger.debug('Show icon event received', { id: detail.id, frameId: detail.frameId });
 
-    // Remove existing icons first (single icon at a time)
-    translationIcons.value = [];
+    const currentIcon = translationIcons.value.find(icon => icon.id === detail.id);
+    const continuationToken = detail.selectionContinuationToken;
+    const isMatchingContinuation = currentIcon && continuationToken && currentIcon.selectionContinuationToken &&
+      continuationToken.originFrameId === currentIcon.selectionContinuationToken.originFrameId &&
+      continuationToken.sequence === currentIcon.selectionContinuationToken.sequence;
+    const position = detail.position || (isMatchingContinuation ? currentIcon.position : null);
+    if (!position) return;
 
-    // Add new icon
-    translationIcons.value.push({
+    const updatedIcon = {
       id: detail.id,
       text: detail.text,
-      position: detail.position
-    });
+      position,
+      selectionPosition: detail.selectionPosition ?? position,
+      selectionContinuationToken: continuationToken ?? null,
+    };
+    const existingIndex = translationIcons.value.findIndex(icon => icon.id === detail.id);
+    if (existingIndex >= 0) {
+      const updatedIcons = [...translationIcons.value];
+      updatedIcons[existingIndex] = updatedIcon;
+      translationIcons.value = updatedIcons;
+    } else {
+      translationIcons.value = [updatedIcon];
+    }
   };
 
   const handleDismissWindow = (detail) => {

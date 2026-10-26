@@ -132,14 +132,22 @@ describe("EventCoordinator cross-frame coordinate adjustment", () => {
     ]);
 
     await coordinator._handleTextSelectionWindowRequest(
-      { position: { x: 100, y: 200 }, selectedText: "hello", options: {} },
+      {
+        position: { x: 100, y: 200 },
+        toolbarPosition: { x: 25, y: 35, _isViewportRelative: true },
+        selectedText: "hello",
+        options: {}
+      },
       sourceWindow,
     );
 
     expect(facade.show).toHaveBeenCalledTimes(1);
-    const [, position] = facade.show.mock.calls[0];
+    const [, position, , toolbarPosition] = facade.show.mock.calls[0];
     expect(position.x).toBe(250); // 100 + 150, added once
     expect(position.y).toBe(500); // 200 + 300, added once
+    expect(toolbarPosition).toEqual({
+      x: 175, y: 335, _isViewportRelative: true, _isAbsolute: false
+    });
   });
 
   it("marks the adjusted position as viewport-relative and non-absolute", async () => {
@@ -151,7 +159,12 @@ describe("EventCoordinator cross-frame coordinate adjustment", () => {
     ]);
 
     await coordinator._handleTextSelectionWindowRequest(
-      { position: { x: 100, y: 200 }, selectedText: "hello", options: {} },
+      {
+        position: { x: 100, y: 200 },
+        toolbarPosition: { x: 25, y: 35, _isViewportRelative: true },
+        selectedText: "hello",
+        options: {}
+      },
       sourceWindow,
     );
 
@@ -171,7 +184,12 @@ describe("EventCoordinator cross-frame coordinate adjustment", () => {
     ]);
 
     await coordinator._handleTextSelectionWindowRequest(
-      { position: { x: 100, y: 200 }, selectedText: "hello", options: {} },
+      {
+        position: { x: 100, y: 200 },
+        toolbarPosition: { x: 25, y: 35, _isViewportRelative: true },
+        selectedText: "hello",
+        options: {}
+      },
       sourceWindow,
     );
 
@@ -190,7 +208,12 @@ describe("EventCoordinator cross-frame coordinate adjustment", () => {
     ]);
 
     await coordinator._handleTextSelectionWindowRequest(
-      { position: { x: 100, y: 200 }, selectedText: "hello", options: {} },
+      {
+        position: { x: 100, y: 200 },
+        toolbarPosition: { x: 25, y: 35, _isViewportRelative: true },
+        selectedText: "hello",
+        options: {}
+      },
       sourceWindow,
     );
 
@@ -198,6 +221,7 @@ describe("EventCoordinator cross-frame coordinate adjustment", () => {
     const [, position] = facade.show.mock.calls[0];
     expect(position).toEqual({ x: 100, y: 200 });
     expect(position._isViewportRelative).toBeUndefined();
+    expect(facade.show.mock.calls[0][3]).toEqual({ x: 25, y: 35, _isViewportRelative: true });
   });
 
   it("ignores the request when not running in the top frame", async () => {
@@ -287,6 +311,7 @@ describe("EventCoordinator cross-frame outside-click resize handling", () => {
       dismiss: vi.fn().mockResolvedValue(undefined),
       displayManager: {
         shouldUseMobileUI: vi.fn(() => false),
+        invalidatePendingShows: vi.fn(),
         _showWindow: vi.fn().mockResolvedValue(undefined),
       },
       dismissalManager: { _removeDismissListener: vi.fn() },
@@ -384,6 +409,68 @@ describe("EventCoordinator cross-frame outside-click resize handling", () => {
     state.shouldPreventDismissal = false;
     await coordinator._handleOutsideClick();
     expect(facade.dismiss).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels queued displays on external selection clear while retaining internal and visible protections", async () => {
+    vi.useFakeTimers();
+    let queuedIconShown = false;
+    let timer = setTimeout(() => { queuedIconShown = true; }, 100);
+    facade.displayManager.invalidatePendingShows.mockImplementation(() => clearTimeout(timer));
+
+    try {
+      await pageEventBus.emit(SELECTION_EVENTS.GLOBAL_SELECTION_CLEAR);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(facade.displayManager.invalidatePendingShows).toHaveBeenCalledTimes(1);
+      expect(queuedIconShown).toBe(false);
+      expect(facade.dismiss).not.toHaveBeenCalled();
+
+      facade._internalDisplayDismissRequestVersion = 3;
+      timer = setTimeout(() => { queuedIconShown = true; }, 100);
+      await pageEventBus.emit(SELECTION_EVENTS.GLOBAL_SELECTION_CLEAR);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(facade.displayManager.invalidatePendingShows).toHaveBeenCalledTimes(1);
+      expect(queuedIconShown).toBe(true);
+
+      facade._internalDisplayDismissRequestVersion = null;
+      state.isVisible = true;
+      state.shouldPreventDismissal = true;
+      await pageEventBus.emit(SELECTION_EVENTS.GLOBAL_SELECTION_CLEAR);
+      expect(facade.displayManager.invalidatePendingShows).toHaveBeenCalledTimes(2);
+      expect(facade.dismiss).not.toHaveBeenCalled();
+    } finally {
+      coordinator.cleanup();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("invalidates queued displays on external clear before UI exists but ignores internal replacement clear", async () => {
+    vi.useFakeTimers();
+    let externalIconShown = false;
+    let internalIconShown = false;
+    let timer = setTimeout(() => { externalIconShown = true; }, 100);
+    facade.displayManager.invalidatePendingShows.mockImplementation(() => clearTimeout(timer));
+
+    try {
+      await pageEventBus.emit(SELECTION_EVENTS.GLOBAL_SELECTION_CLEAR);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(facade.displayManager.invalidatePendingShows).toHaveBeenCalledTimes(1);
+      expect(externalIconShown).toBe(false);
+      expect(facade.dismiss).not.toHaveBeenCalled();
+
+      facade._internalDisplayDismissRequestVersion = 7;
+      timer = setTimeout(() => { internalIconShown = true; }, 100);
+      await pageEventBus.emit(SELECTION_EVENTS.GLOBAL_SELECTION_CLEAR);
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(facade.displayManager.invalidatePendingShows).toHaveBeenCalledTimes(1);
+      expect(internalIconShown).toBe(true);
+      expect(facade.dismiss).not.toHaveBeenCalled();
+    } finally {
+      coordinator.cleanup();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
   });
 
   it("allows selection clear after bounded Vue transition while translation remains pending", async () => {
@@ -758,6 +845,7 @@ describe("EventCoordinator PageEventBus listener ownership", () => {
       dismiss: vi.fn(),
       show: vi.fn(),
       displayManager: {
+        invalidatePendingShows: vi.fn(),
         _showWindow: vi.fn().mockResolvedValue(undefined),
       },
       dismissalManager: {
@@ -877,6 +965,94 @@ describe("EventCoordinator PageEventBus listener ownership", () => {
     );
     expect(old.facade.show).not.toHaveBeenCalled();
     expect(live.facade.show).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("EventCoordinator duplicate selection display suppression", () => {
+  let coordinator;
+  let facade;
+  let state;
+  let observedSelection;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    mockPageEventBus.reset();
+    state = {};
+    let pendingTimer;
+    let committed;
+    facade = {
+      show: vi.fn((text, position, options, toolbarPosition) => {
+        clearTimeout(pendingTimer);
+        pendingTimer = setTimeout(() => {
+          committed = { text, position, options, toolbarPosition };
+        }, 100);
+      }),
+    };
+    facade.getCommitted = () => committed;
+    coordinator = new EventCoordinator(facade, {
+      state,
+      crossFrameManager: { isTopFrame: true, setEventHandlers: vi.fn() },
+      translationHandler: {},
+      errorHandler: {},
+      clickManager: { setHandlers: vi.fn() },
+      themeManager: {},
+      positionCalculator: {},
+    });
+    coordinator.setup();
+    observedSelection = vi.fn();
+    pageEventBus.on(SELECTION_EVENTS.GLOBAL_SELECTION_CHANGE, observedSelection);
+  });
+
+  afterEach(() => {
+    pageEventBus.off(SELECTION_EVENTS.GLOBAL_SELECTION_CHANGE, observedSelection);
+    coordinator.cleanup();
+    mockPageEventBus.reset();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("clears continuation globals but leaves a pending display untouched for duplicates", async () => {
+    const originalPosition = { x: 12, y: 34, _isViewportRelative: false };
+    const originalToolbarPosition = { x: 50, y: 60 };
+    const originalGeometry = { anchor: "original-selection" };
+    const originalDetail = {
+      text: "same text", position: originalPosition,
+      options: { geometry: originalGeometry }, toolbarPosition: originalToolbarPosition,
+    };
+    await pageEventBus.emit(SELECTION_EVENTS.GLOBAL_SELECTION_CHANGE, originalDetail);
+    await vi.advanceTimersByTimeAsync(50);
+
+    window.__translateItSelectionDisplayToken = { originFrameId: "frame", sequence: 2 };
+    window.__translateItSelectionDisplayInteraction = "selection-continuation";
+    const duplicateDetail = {
+      text: "same text", position: { x: 99, y: 100 },
+      options: { geometry: { anchor: "duplicate-selection" } },
+      suppressWindowsManagerDisplay: true,
+    };
+    await pageEventBus.emit(SELECTION_EVENTS.GLOBAL_SELECTION_CHANGE, duplicateDetail);
+
+    expect(facade.show).toHaveBeenCalledOnce();
+    expect(window.__translateItSelectionDisplayToken).toBeNull();
+    expect(window.__translateItSelectionDisplayInteraction).toBeNull();
+    expect(observedSelection).toHaveBeenNthCalledWith(2, duplicateDetail);
+    expect(facade.getCommitted()).toBeUndefined();
+
+    await vi.advanceTimersByTimeAsync(50);
+    expect(facade.getCommitted()).toEqual({
+      text: "same text", position: originalPosition, options: { geometry: originalGeometry },
+      toolbarPosition: originalToolbarPosition,
+    });
+
+    await pageEventBus.emit(SELECTION_EVENTS.GLOBAL_SELECTION_CHANGE, {
+      text: "different text", position: { x: 70, y: 80 }, options: {},
+    });
+    expect(facade.show).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(facade.getCommitted()).toEqual({
+      text: "different text", position: { x: 70, y: 80 }, options: {}, toolbarPosition: undefined,
+    });
   });
 });
 
