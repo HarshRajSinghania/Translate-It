@@ -39,8 +39,12 @@
       <!-- Clear Button: Minimized clear fields button -->
       <button
         class="ti-btn-min-clear"
+        :class="{ 'ti-clear-hidden': !showClearButton }"
         :title="t('popup_clear_storage_title_icon') || 'پاک کردن فیلدها'"
         :aria-label="t('popup_clear_storage_title_icon') || 'پاک کردن فیلدها'"
+        :disabled="!showClearButton"
+        :aria-hidden="!showClearButton"
+        :tabindex="showClearButton ? 0 : -1"
         @click="emit('clear')"
       >
         <MaskIcon
@@ -120,6 +124,10 @@ const props = defineProps({
   lastKeyword: {
     type: String,
     default: ''
+  },
+  showClearButton: {
+    type: Boolean,
+    default: true
   }
 })
 
@@ -161,6 +169,7 @@ const translationFormRef = ref(null)
  */
 defineExpose({
   triggerTranslation: (...args) => translationFormRef.value?.triggerTranslation(...args),
-  cancelTranslation: (...args) => translationFormRef.value?.cancelTranslation(...args)
+  cancelTranslation: (...args) => translationFormRef.value?.cancelTranslation(...args),
+  focusSourceInput: () => translationFormRef.value?.focusSourceInput()
 })
 </script>

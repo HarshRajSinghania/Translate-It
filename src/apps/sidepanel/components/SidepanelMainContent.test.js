@@ -5,6 +5,7 @@ import MaskIcon from '@/components/shared/MaskIcon.vue';
 import SidepanelMainContent from './SidepanelMainContent.vue';
 import { TranslationMode } from '@/shared/config/config.js';
 
+const mockFocusTextarea = vi.fn();
 const mockUnifiedTranslation = {
   sourceText: ref('expressions'),
   translatedText: ref('表达方式'),
@@ -32,7 +33,12 @@ const mockUnifiedTranslation = {
   getRetryCallback: vi.fn((retryFunction) => retryFunction),
   getSettingsCallback: vi.fn(() => vi.fn()),
   cancelTranslation: vi.fn(),
-  clearTranslation: vi.fn(),
+  clearTranslation: vi.fn(async () => {
+    mockUnifiedTranslation.sourceText.value = '';
+    mockUnifiedTranslation.translatedText.value = '';
+    mockUnifiedTranslation.sourceLanguage.value = mockLanguageDefaults.savedSourceLanguage.value;
+    mockUnifiedTranslation.targetLanguage.value = mockLanguageDefaults.savedTargetLanguage.value;
+  }),
   initializeSessionState: vi.fn().mockResolvedValue(undefined),
 };
 
@@ -106,6 +112,9 @@ vi.mock('@/components/shared/ProviderSelector.vue', () => ({
 vi.mock('@/components/shared/TranslationInputField.vue', () => ({
   default: {
     name: 'TranslationInputField',
+    setup(_props, { expose }) {
+      expose({ focusTextarea: mockFocusTextarea });
+    },
     template: '<div class="translation-input-stub" />',
   },
 }));
@@ -136,6 +145,14 @@ vi.mock('webextension-polyfill', () => ({
 describe('SidepanelMainContent.vue', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockFocusTextarea.mockClear();
+    mockUnifiedTranslation.sourceText.value = 'expressions';
+    mockUnifiedTranslation.translatedText.value = '表达方式';
+    mockUnifiedTranslation.sourceLanguage.value = 'en';
+    mockUnifiedTranslation.targetLanguage.value = 'fa';
+    mockLanguageDefaults.savedSourceLanguage.value = 'en';
+    mockLanguageDefaults.savedTargetLanguage.value = 'fa';
+    mockUnifiedTranslation.initializeSessionState.mockResolvedValue(undefined);
   });
 
   it('continues to pass dictionary metadata to TranslationDisplay', async () => {
@@ -202,8 +219,10 @@ describe('SidepanelMainContent.vue', () => {
 
     try {
       wrapper = mount(SidepanelMainContent, { props: { provider: '' } });
+      await wrapper.vm.initializeSessionState();
       await vi.advanceTimersByTimeAsync(100);
       const wideButton = wrapper.get('.inline-clear-btn');
+      expect(wideButton.attributes('disabled')).toBeUndefined();
       const wideIcon = wideButton.findComponent(MaskIcon);
       expect(wideButton.attributes('aria-label')).toBeTruthy();
       expect(wideButton.attributes('aria-label')).toBe(wideButton.attributes('title'));
@@ -212,19 +231,28 @@ describe('SidepanelMainContent.vue', () => {
       expect(wideIcon.attributes('aria-hidden')).toBe('true');
       await wideButton.trigger('click');
       expect(mockUnifiedTranslation.clearTranslation).toHaveBeenCalledTimes(1);
+      await wrapper.vm.$nextTick();
+      expect(wrapper.get('.inline-clear-btn').element).toBe(wideButton.element);
+      expect(wrapper.get('.inline-clear-btn').attributes('disabled')).toBeDefined();
       wrapper.unmount();
 
       width = 509;
+      mockUnifiedTranslation.sourceText.value = 'expressions';
       wrapper = mount(SidepanelMainContent, { props: { provider: '' } });
+      await wrapper.vm.initializeSessionState();
       await vi.advanceTimersByTimeAsync(100);
       const narrowButton = wrapper.get('.row-clear-btn');
+      expect(narrowButton.attributes('disabled')).toBeUndefined();
+      expect(wrapper.findAll('.end-spacer')).toHaveLength(1);
+      expect(wrapper.get('.center-spacer').element.nextElementSibling.classList.contains('end-spacer')).toBe(true);
       const narrowIcon = narrowButton.findComponent(MaskIcon);
       expect(narrowButton.attributes('aria-label')).toBeTruthy();
       expect(narrowButton.attributes('aria-label')).toBe(narrowButton.attributes('title'));
       expect(narrowIcon.classes()).toContain('clear-mask-icon');
       expect(narrowIcon.props('size')).toBe(16);
       expect(narrowIcon.attributes('aria-hidden')).toBe('true');
-      await narrowButton.trigger('click');
+      await narrowButton.trigger('keydown', { key: 'Enter' });
+      await narrowButton.trigger('click'); // browsers synthesize this click for Enter activation
       expect(mockUnifiedTranslation.clearTranslation).toHaveBeenCalledTimes(2);
     } finally {
       wrapper?.unmount();
@@ -236,6 +264,169 @@ describe('SidepanelMainContent.vue', () => {
       } else {
         delete HTMLElement.prototype.offsetWidth;
       }
+    }
+  });
+
+  it('focuses source only after successful clear and preserves focus/errors/unmount', async () => {
+    const previousResizeObserver = globalThis.ResizeObserver;
+    globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+    const pending = () => {
+      let resolve;
+      let reject;
+      const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+      return { promise, resolve, reject };
+    };
+    let wrapper = mount(SidepanelMainContent, { attachTo: document.body, props: { provider: '' } });
+
+    try {
+      await wrapper.vm.initializeSessionState();
+      const button = wrapper.get('.row-clear-btn');
+      button.element.focus();
+      const clear = pending();
+      mockUnifiedTranslation.clearTranslation.mockReturnValueOnce(clear.promise);
+      const clearResult = wrapper.vm.clearFields();
+      expect(mockFocusTextarea).not.toHaveBeenCalled();
+      clear.resolve();
+      await clearResult;
+      expect(mockFocusTextarea).toHaveBeenCalledTimes(1);
+
+      mockUnifiedTranslation.sourceText.value = 'expressions';
+      mockUnifiedTranslation.translatedText.value = '表达方式';
+      await wrapper.vm.$nextTick();
+      mockFocusTextarea.mockClear();
+      const blurByDisable = pending();
+      mockUnifiedTranslation.clearTranslation.mockImplementationOnce(() => {
+        mockUnifiedTranslation.sourceText.value = '';
+        mockUnifiedTranslation.translatedText.value = '';
+        mockUnifiedTranslation.sourceLanguage.value = mockLanguageDefaults.savedSourceLanguage.value;
+        mockUnifiedTranslation.targetLanguage.value = mockLanguageDefaults.savedTargetLanguage.value;
+        return blurByDisable.promise;
+      });
+      const clearButton = wrapper.get('.row-clear-btn');
+      clearButton.element.focus();
+      expect(document.activeElement).toBe(clearButton.element);
+      const disabledButtonClear = wrapper.vm.clearFields();
+      await wrapper.vm.$nextTick();
+      expect(clearButton.attributes('disabled')).toBeDefined();
+      document.body.setAttribute('tabindex', '-1');
+      document.body.focus();
+      expect(document.activeElement).toBe(document.body);
+      blurByDisable.resolve();
+      await disabledButtonClear;
+      await wrapper.vm.$nextTick();
+      expect(mockFocusTextarea).toHaveBeenCalledTimes(1);
+
+      mockFocusTextarea.mockClear();
+      const changedFocusClear = pending();
+      mockUnifiedTranslation.clearTranslation.mockReturnValueOnce(changedFocusClear.promise);
+      const changedResult = wrapper.vm.clearFields();
+      const otherInput = document.createElement('input');
+      document.body.append(otherInput);
+      otherInput.focus();
+      changedFocusClear.resolve();
+      await changedResult;
+      expect(document.activeElement).toBe(otherInput);
+      expect(mockFocusTextarea).not.toHaveBeenCalled();
+      otherInput.remove();
+
+      const failure = pending();
+      mockUnifiedTranslation.clearTranslation.mockReturnValueOnce(failure.promise);
+      const failedResult = wrapper.vm.clearFields();
+      failure.reject(new Error('clear failed'));
+      await expect(failedResult).rejects.toThrow('clear failed');
+      expect(mockFocusTextarea).not.toHaveBeenCalled();
+
+      const unmountClear = pending();
+      mockUnifiedTranslation.clearTranslation.mockReturnValueOnce(unmountClear.promise);
+      const unmountResult = wrapper.vm.clearFields();
+      wrapper.unmount();
+      wrapper = null;
+      unmountClear.resolve();
+      await unmountResult;
+      expect(mockFocusTextarea).not.toHaveBeenCalled();
+    } finally {
+      wrapper?.unmount();
+      document.body.removeAttribute('tabindex');
+      if (previousResizeObserver === undefined) delete globalThis.ResizeObserver;
+      else globalThis.ResizeObserver = previousResizeObserver;
+    }
+  });
+
+  it('shows clear only for content or a non-default language, after session restore', async () => {
+    mockUnifiedTranslation.sourceText.value = '';
+    mockUnifiedTranslation.translatedText.value = '';
+    const wrapper = mount(SidepanelMainContent, { props: { provider: '' } });
+
+    try {
+      const clearButton = wrapper.get('.row-clear-btn');
+      expect(clearButton.attributes('disabled')).toBeDefined();
+      expect(clearButton.attributes('aria-hidden')).toBe('true');
+      expect(wrapper.findAll('.end-spacer')).toHaveLength(1);
+      const provider = wrapper.get('.center-spacer').element.firstElementChild;
+
+      await wrapper.vm.initializeSessionState();
+      expect(wrapper.get('.row-clear-btn').element).toBe(clearButton.element);
+      expect(wrapper.get('.row-clear-btn').attributes('disabled')).toBeDefined();
+      expect(wrapper.get('.center-spacer').element.firstElementChild).toBe(provider);
+
+      mockUnifiedTranslation.sourceText.value = ' ';
+      await wrapper.vm.$nextTick();
+      expect(wrapper.get('.row-clear-btn').attributes('disabled')).toBeUndefined();
+
+      mockUnifiedTranslation.sourceText.value = '';
+      mockUnifiedTranslation.translatedText.value = 'translated';
+      await wrapper.vm.$nextTick();
+      expect(wrapper.get('.row-clear-btn').attributes('disabled')).toBeUndefined();
+
+      mockUnifiedTranslation.translatedText.value = '';
+      mockUnifiedTranslation.sourceLanguage.value = 'de';
+      await wrapper.vm.$nextTick();
+      expect(wrapper.get('.row-clear-btn').attributes('disabled')).toBeUndefined();
+
+      mockUnifiedTranslation.sourceLanguage.value = 'en';
+      mockUnifiedTranslation.targetLanguage.value = 'fr';
+      await wrapper.vm.$nextTick();
+      expect(wrapper.get('.row-clear-btn').attributes('disabled')).toBeUndefined();
+
+      mockUnifiedTranslation.targetLanguage.value = 'fa';
+      await wrapper.vm.$nextTick();
+      expect(wrapper.get('.row-clear-btn').attributes('disabled')).toBeDefined();
+
+      mockLanguageDefaults.savedSourceLanguage.value = 'de';
+      await wrapper.vm.$nextTick();
+      expect(wrapper.get('.row-clear-btn').attributes('disabled')).toBeUndefined();
+      mockLanguageDefaults.savedSourceLanguage.value = 'en';
+      await wrapper.vm.$nextTick();
+      expect(wrapper.get('.row-clear-btn').attributes('disabled')).toBeDefined();
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it('treats canonical Chinese language codes as saved defaults after clearing', async () => {
+    mockLanguageDefaults.savedSourceLanguage.value = 'zh';
+    mockLanguageDefaults.savedTargetLanguage.value = 'zh';
+    mockUnifiedTranslation.sourceText.value = '';
+    mockUnifiedTranslation.translatedText.value = '';
+    mockUnifiedTranslation.sourceLanguage.value = 'en';
+    mockUnifiedTranslation.targetLanguage.value = 'en';
+    mockUnifiedTranslation.clearTranslation.mockImplementation(async () => {
+      mockUnifiedTranslation.sourceText.value = '';
+      mockUnifiedTranslation.translatedText.value = '';
+      mockUnifiedTranslation.sourceLanguage.value = 'zh-cn';
+      mockUnifiedTranslation.targetLanguage.value = 'zh-cn';
+    });
+
+    const wrapper = mount(SidepanelMainContent, { props: { provider: '' } });
+    try {
+      await wrapper.vm.initializeSessionState();
+      expect(wrapper.get('.row-clear-btn').attributes('disabled')).toBeUndefined();
+
+      await wrapper.vm.clearFields();
+
+      expect(wrapper.get('.row-clear-btn').attributes('disabled')).toBeDefined();
+    } finally {
+      wrapper.unmount();
     }
   });
 

@@ -34,9 +34,13 @@
           class="translate-button-inline"
         >
           <button
-            class="ti-icon-button inline-clear-btn"
+            class="ti-icon-button inline-clear-btn ti-sidepanel-clear-action"
+            :class="{ 'ti-clear-hidden': !showClearButton }"
             :title="t('SIDEPANEL_CLEAR_STORAGE_TITLE_ICON', 'Clear fields')"
             :aria-label="t('SIDEPANEL_CLEAR_STORAGE_TITLE_ICON', 'Clear fields')"
+            :disabled="!showClearButton"
+            :aria-hidden="!showClearButton"
+            :tabindex="showClearButton ? 0 : -1"
             @click="clearFields"
           >
             <MaskIcon
@@ -66,9 +70,13 @@
         class="translate-button-row"
       >
         <button
-          class="ti-icon-button row-clear-btn"
+          class="ti-icon-button row-clear-btn ti-sidepanel-clear-action"
+          :class="{ 'ti-clear-hidden': !showClearButton }"
           :title="t('SIDEPANEL_CLEAR_STORAGE_TITLE_ICON', 'Clear fields')"
           :aria-label="t('SIDEPANEL_CLEAR_STORAGE_TITLE_ICON', 'Clear fields')"
+          :disabled="!showClearButton"
+          :aria-hidden="!showClearButton"
+          :tabindex="showClearButton ? 0 : -1"
           @click="clearFields"
         >
           <MaskIcon
@@ -158,6 +166,7 @@ import { useUnifiedTranslation } from '@/features/translation/composables/useUni
 import { useLanguageDefaults } from '@/features/settings/composables/useLanguageDefaults.js'
 import { useErrorHandler } from '@/composables/shared/useErrorHandler.js'
 import { useUnifiedI18n } from '@/composables/shared/useUnifiedI18n.js'
+import { getCanonicalCode } from '@/shared/config/languageConstants.js'
 
 // Components
 import LanguageSelector from '@/components/shared/LanguageSelector.vue'
@@ -222,8 +231,17 @@ const {
   setSourceLanguageAsDefault,
   setTargetLanguageAsDefault
 } = useLanguageDefaults()
-const sourceIsSavedDefault = computed(() => sourceLanguage.value === savedSourceLanguage.value)
-const targetIsSavedDefault = computed(() => targetLanguage.value === savedTargetLanguage.value)
+const sourceIsSavedDefault = computed(() => getCanonicalCode(sourceLanguage.value) === getCanonicalCode(savedSourceLanguage.value))
+const targetIsSavedDefault = computed(() => getCanonicalCode(targetLanguage.value) === getCanonicalCode(savedTargetLanguage.value))
+const showClearButton = computed(() => (
+  isSessionStateReady.value
+  && (
+    sourceText.value !== ''
+    || translatedText.value !== ''
+    || !sourceIsSavedDefault.value
+    || !targetIsSavedDefault.value
+  )
+))
 const sourceDefaultTitle = computed(() => t('sidepanel_set_source_language_default_title', 'Set current source language as default'))
 const targetDefaultTitle = computed(() => t('sidepanel_set_target_language_default_title', 'Set current target language as default'))
 const { handleError } = useErrorHandler()
@@ -231,6 +249,14 @@ const { handleError } = useErrorHandler()
 // Refs
 const sourceInputRef = ref(null)
 const translationResultRef = ref(null)
+const isSessionStateReady = ref(false)
+const initializeSessionStateForView = async (...args) => {
+  try {
+    return await initializeSessionState(...args)
+  } finally {
+    isSessionStateReady.value = true
+  }
+}
 
 const retryTranslation = getRetryCallback(() => triggerTranslation(
   sourceLanguage.value,
@@ -363,7 +389,13 @@ const handleTranslate = async (data) => {
 
 const clearFields = async () => {
   logger.debug("Clearing fields and resetting languages");
+  const activeElement = document.activeElement;
   await clearTranslation();
+  const focusStayedOnClear = document.activeElement === activeElement
+    || (activeElement?.matches('.ti-sidepanel-clear-action') && document.activeElement === document.body);
+  if (!isUnmounted && focusStayedOnClear) {
+    sourceInputRef.value?.focusTextarea?.();
+  }
 };
 
 const handleSetDefaultSource = async () => {
@@ -386,7 +418,7 @@ const handleSetDefaultTarget = async () => {
 defineExpose({
   clearFields,
   sourceInputRef,
-  initializeSessionState
+  initializeSessionState: initializeSessionStateForView
 });
 
 
