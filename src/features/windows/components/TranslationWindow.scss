@@ -203,6 +203,7 @@
     overflow-y: hidden !important;
     margin: 0 !important;
     padding: 0 !important;
+    padding-inline: 2px !important;
     border: 0 !important;
     border-radius: 0 !important;
     outline: none !important;
@@ -212,7 +213,7 @@
     font-size: inherit !important;
     font-weight: inherit !important;
     line-height: inherit !important;
-    unicode-bidi: plaintext !important;
+    text-align: start !important;
     field-sizing: content !important;
 
     &.ti-window-source-overflow {

@@ -194,10 +194,13 @@ export function isRTLStrongCharacter(code) {
  * Checks if a character code belongs to an LTR strong directional category.
  * Includes: Latin, Greek, Cyrillic, etc.
  * @param {number} code - Unicode character code
+ * @param {boolean} includeUnicodeLetters - Also recognize Han, Hiragana, Katakana, and Devanagari letters
  * @returns {boolean}
  */
-export function isLTRStrongCharacter(code) {
-  return (
+export function isLTRStrongCharacter(code, includeUnicodeLetters = false) {
+  if (isRTLStrongCharacter(code)) return false;
+
+  const isKnownLTR = (
     (code >= 0x0041 && code <= 0x005A) ||  // Basic Latin uppercase
     (code >= 0x0061 && code <= 0x007A) ||  // Basic Latin lowercase
     (code >= 0x00C0 && code <= 0x00D6) ||  // Latin-1 Supplement letters
@@ -212,15 +215,22 @@ export function isLTRStrongCharacter(code) {
     (code >= 0x1E00 && code <= 0x1EFF) ||  // Latin Extended Additional
     (code === 0x200E)                      // Left-to-Right Mark
   );
+
+  if (isKnownLTR || !includeUnicodeLetters) return isKnownLTR;
+
+  const character = String.fromCodePoint(code);
+  return /\p{L}/u.test(character) && /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Devanagari}]/u.test(character);
 }
 
 /**
  * Check if RTL (Right-to-Left) should be applied to text based on content.
  * Uses a majority-voting algorithm with strong directional character detection.
  * @param {string} text - Text to check
+ * @param {number} rtlThreshold - RTL ratio must be strictly greater than this value
+ * @param {boolean} includeUnicodeLetters - Count Han, Hiragana, Katakana, and Devanagari letters as LTR strong
  * @returns {boolean} True if RTL should be applied
  */
-export const shouldApplyRtl = (text) => {
+export const shouldApplyRtl = (text, rtlThreshold = 0.4, includeUnicodeLetters = false) => {
   if (!text || typeof text !== 'string') return false;
   const trimmedText = text.trim();
   if (trimmedText.length === 0) return false;
@@ -233,15 +243,14 @@ export const shouldApplyRtl = (text) => {
     if (code > 0xFFFF) i++; // Handle surrogate pairs
 
     if (isRTLStrongCharacter(code)) rtlStrongCount++;
-    else if (isLTRStrongCharacter(code)) ltrStrongCount++;
+    else if (isLTRStrongCharacter(code, includeUnicodeLetters)) ltrStrongCount++;
   }
 
   // If no strong characters found, default to LTR
   if (rtlStrongCount === 0 && ltrStrongCount === 0) return false;
 
-  // RTL Bias: If any significant RTL content exists, or more than 40% is RTL, consider it RTL
-  // This helps with mixed strings where the target context is usually RTL.
-  return (rtlStrongCount / (rtlStrongCount + ltrStrongCount)) > 0.4;
+  // The default threshold preserves the existing RTL bias for mixed strings.
+  return (rtlStrongCount / (rtlStrongCount + ltrStrongCount)) > rtlThreshold;
 };
 
 /**

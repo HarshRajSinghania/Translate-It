@@ -487,6 +487,7 @@ describe('TranslationWindow.vue', () => {
 
     expect(originalTextStyles).not.toMatch(/(?:max-height|overflow-y)\s*:/);
     expect(sourceInputStyles).toMatch(/max-height\s*:\s*150px/);
+    expect(sourceInputStyles).toMatch(/padding-inline\s*:\s*2px/);
     expect(sourceInputStyles).toMatch(/overflow-y\s*:\s*hidden/);
     expect(sourceInputStyles).toMatch(/&\.ti-window-source-overflow\s*\{\s*overflow-y\s*:\s*auto/);
   });
@@ -630,7 +631,7 @@ describe('TranslationWindow.vue', () => {
   it('confirms changed source text on Enter, preserves Shift+Enter, and restores on Escape', async () => {
     const wrapper = mount(TranslationWindow, { props: baseProps });
     const editor = wrapper.find('.ti-window-source-input');
-    expect(editor.attributes('dir')).toBe('auto');
+    expect(editor.attributes('dir')).toBe('ltr');
     await editor.setValue('  edited source  ');
     await editor.trigger('keydown', { key: 'Enter' });
     expect(pageEventBus.emit).toHaveBeenCalledWith('translation-window-confirm-source', {
@@ -643,6 +644,63 @@ describe('TranslationWindow.vue', () => {
     await editor.trigger('keydown', { key: 'Escape' });
     expect(editor.element.value).toBe('expressions');
     expect(pageEventBus.emit).not.toHaveBeenCalled();
+  });
+
+  it('tracks source direction from text, falls back to language only without strong characters, and preserves IME editing', async () => {
+    const wrapper = mount(TranslationWindow, { props: { ...baseProps, sourceLanguage: 'fa' } });
+    const editor = wrapper.find('.ti-window-source-input');
+    const element = editor.element;
+
+    await editor.setValue('Hello سلام سلام');
+    expect(editor.attributes('dir')).toBe('rtl');
+    for (const mixedScript of ['日本語日本語سلام', '中文中文中文سلام', 'नमस्तेभारतسلام']) {
+      await editor.setValue(mixedScript);
+      expect(editor.attributes('dir')).toBe('ltr');
+    }
+    for (const rtlAndUnsupportedScript of [
+      `سلام ${String.fromCodePoint(0x1E900, 0x1E901, 0x1E902, 0x1E903, 0x1E904)}`,
+      `سلام ${String.fromCodePoint(0x0840, 0x0841, 0x0842, 0x0843, 0x0844)}`,
+    ]) {
+      await editor.setValue(rtlAndUnsupportedScript);
+      expect(editor.attributes('dir')).toBe('rtl');
+    }
+    await editor.setValue('سلامabcd');
+    expect(editor.attributes('dir')).toBe('ltr');
+    await editor.setValue('This is English with سلام');
+    expect(editor.attributes('dir')).toBe('ltr');
+    await editor.setValue('123! —\n...');
+    expect(editor.attributes('dir')).toBe('rtl');
+    await wrapper.setProps({ sourceLanguage: 'en' });
+    expect(editor.attributes('dir')).toBe('ltr');
+    await wrapper.setProps({ sourceLanguage: 'fa' });
+    expect(editor.attributes('dir')).toBe('rtl');
+
+    await wrapper.setProps({ sourceLanguage: 'auto' });
+    await editor.setValue('Hello');
+    element.value = 'Hello';
+    element.setSelectionRange(2, 2);
+    element.dispatchEvent(new Event('compositionstart', { bubbles: true }));
+    element.value = 'Hello سلام سلام';
+    element.setSelectionRange(5, 5);
+    element.dispatchEvent(new InputEvent('input', {
+      bubbles: true,
+      inputType: 'insertCompositionText',
+      data: ' سلام سلام',
+      isComposing: true,
+    }));
+    await nextTick();
+    expect(element.selectionStart).toBe(5);
+    expect(element.selectionEnd).toBe(5);
+    expect(editor.attributes('dir')).toBe('ltr');
+    expect(pageEventBus.emit).not.toHaveBeenCalledWith('translation-window-confirm-source', expect.anything());
+    element.dispatchEvent(new Event('compositionend', { bubbles: true }));
+    await nextTick();
+    expect(element.value).toBe('Hello سلام سلام');
+    expect(editor.attributes('dir')).toBe('rtl');
+    expect(element.selectionStart).toBe(5);
+    expect(element.selectionEnd).toBe(5);
+
+    wrapper.unmount();
   });
 
   it('stops textarea keyboard events from bubbling without changing keydown behavior', async () => {
@@ -789,9 +847,20 @@ describe('TranslationWindow.vue', () => {
     expect(editor.element.value).toBe('local edit');
     await wrapper.setProps({ historyIndex: 1, selectedText: baseProps.selectedText });
     expect(editor.element.value).toBe(baseProps.selectedText);
+    expect(editor.attributes('dir')).toBe('ltr');
+    await wrapper.setProps({ historyIndex: 2, selectedText: 'Hello سلام سلام' });
+    expect(editor.attributes('dir')).toBe('rtl');
+    await wrapper.setProps({ historyIndex: 3, selectedText: baseProps.selectedText });
+    expect(editor.attributes('dir')).toBe('ltr');
     await editor.setValue('another local edit');
     await wrapper.setProps({ selectedText: 'restored source' });
     expect(editor.element.value).toBe('restored source');
+    await wrapper.setProps({ selectedText: 'Hello سلام سلام' });
+    expect(editor.attributes('dir')).toBe('rtl');
+    await editor.setValue('edited English');
+    await wrapper.setProps({ isError: true });
+    expect(editor.element.value).toBe('Hello سلام سلام');
+    expect(editor.attributes('dir')).toBe('rtl');
   });
 
   it('discards a draft when the parent reports confirmation failure', async () => {
