@@ -13,6 +13,7 @@ import { PublicTranslationErrorActions } from '@/shared/error-management/PublicT
 import { createLegacyDisplayError } from '@/shared/error-management/PublicTranslationErrorAdapter.js'
 import { getScopedLogger } from '@/shared/logging/logger.js'
 import { LOG_COMPONENTS } from '@/shared/logging/logConstants.js'
+import { openOptionsPage } from '@/core/helpers.js'
 
 // Lazy logger to avoid TDZ ReferenceErrors when bundled
 const logger = new Proxy({}, {
@@ -151,38 +152,29 @@ export function useTranslationError(context = 'unknown') {
     currentError.value = null
     errorMessage.value = ''
     errorType.value = ''
-    errorTimestamp.value = null
     canRetry.value = false
     canOpenSettings.value = false
-    
-    logger.debug(`[${context}] Error state cleared`)
-  }
-  
-  /**
-   * Check if an error is retryable
-   * @param {Error|string} error - Error to check
-   * @returns {boolean} True if retryable
-   */
-  const isErrorRetryable = (error) => {
-    return isRetryableError(error)
+    errorTimestamp.value = null
   }
   
   /**
    * Get retry callback for current error
-   * @param {Function} retryFunction - Function to call for retry
+   * @param {Function} retryFn - Function to retry the operation
    * @returns {Function} Retry callback
    */
-  const getRetryCallback = (retryFunction) => {
+  const getRetryCallback = (retryFn) => {
     return async () => {
-      if (!canRetry.value || !retryFunction) {
+      if (!canRetry.value) {
         logger.warn(`[${context}] Retry attempted but not available`)
         return
       }
       
       try {
-        logger.info(`[${context}] Retrying after error: ${errorType.value}`)
-        clearError() // Clear error before retry
-        await retryFunction()
+        logger.info(`[${context}] Retrying translation after error: ${errorType.value}`)
+        clearError()
+        if (typeof retryFn === 'function') {
+          await retryFn()
+        }
       } catch (retryError) {
         logger.error(`[${context}] Retry failed:`, retryError)
         await handleError(retryError)
@@ -203,8 +195,8 @@ export function useTranslationError(context = 'unknown') {
       
       try {
         logger.info(`[${context}] Opening settings for error: ${errorType.value}`)
-        // Use ErrorHandler's settings callback
-        errorHandler.openOptionsPageCallback?.()
+        // Open the extension options page via the established helper
+        openOptionsPage()
       } catch (settingsError) {
         logger.error(`[${context}] Failed to open settings:`, settingsError)
       }
@@ -218,75 +210,51 @@ export function useTranslationError(context = 'unknown') {
     if (unsubscribeListener) return // Already setup
     
     const listener = (errorData) => {
-      // Only handle errors for our context
-      if (errorData.context && !errorData.context.includes(context)) {
-        return
+      if (errorData.context && errorData.context.includes(context)) {
+        logger.debug(`[${context}] Received UI error update:`, errorData)
+        currentError.value = errorData
+        errorMessage.value = errorData.message
+        errorType.value = errorData.type
+        errorTimestamp.value = errorData.timestamp
+        canRetry.value = errorData.canRetry || false
+        canOpenSettings.value = errorData.canOpenSettings || false
       }
-
-      logger.debug(`[${context}] Received UI error update:`, errorData)
-
-      const hasPublicEcho = typeof errorData.canRetry === 'boolean'
-      const publicError = hasPublicEcho
-        ? mapCanonicalTranslationError({ type: errorData.type })
-        : null
-
-      // Update error state from listener
-      currentError.value = errorData
-      errorMessage.value = errorData.message
-      errorType.value = errorData.type
-      errorTimestamp.value = errorData.timestamp
-
-      const strategy = getErrorDisplayStrategy(context, errorData.type)
-      canRetry.value = hasPublicEcho
-        ? errorData.canRetry
-        : shouldShowRetry(errorData.type, strategy)
-      canOpenSettings.value = hasPublicEcho
-        ? publicError.action === PublicTranslationErrorActions.OPEN_SETTINGS
-        : shouldShowSettings(errorData.type, strategy)
     }
     
     unsubscribeListener = errorHandler.addUIErrorListener(listener)
-    logger.debug(`[${context}] Error listener setup`)
   }
   
   /**
    * Cleanup error listener
    */
-  const cleanupErrorListener = () => {
+  const cleanup = () => {
     if (unsubscribeListener) {
       unsubscribeListener()
       unsubscribeListener = null
-      logger.debug(`[${context}] Error listener cleaned up`)
     }
   }
   
-  // Setup listener on creation
+  // Setup listener on composable creation
   setupErrorListener()
   
   // Cleanup on unmount
-  onUnmounted(() => {
-    cleanupErrorListener()
-  })
+  onUnmounted(cleanup)
   
   return {
-    // Error state
-    currentError,
+    // State
+    hasError,
     errorMessage: processedErrorMessage,
     errorType,
-    hasError,
     canRetry,
     canOpenSettings,
     errorTimestamp,
+    errorDisplayLevel,
     
     // Methods
     handleError,
     clearError,
-    isErrorRetryable,
     getRetryCallback,
     getSettingsCallback,
-    
-    // Utils
-    setupErrorListener,
-    cleanupErrorListener
+    isRetryableError
   }
 }
