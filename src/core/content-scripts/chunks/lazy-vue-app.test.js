@@ -30,6 +30,8 @@ vi.mock('@/core/extensionContext.js', () => ({
 
 const HOST_ID = 'translate-it-host-main';
 const showPopoverDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'showPopover');
+let frameCallbacks;
+let frameId = 0;
 
 const makeCore = () => ({ vueLoaded: false, dispatchEvent: vi.fn() });
 
@@ -37,16 +39,40 @@ beforeEach(() => {
   vi.resetModules();
   vi.clearAllMocks();
   document.getElementById(HOST_ID)?.remove();
+  document.head.querySelectorAll('[data-test-root-promotion]').forEach(style => style.remove());
   document.documentElement.style.cssText = '';
+  frameCallbacks = null;
+  frameId = 0;
 });
 
-afterEach(() => {
+afterEach(async () => {
+  const { cleanupVueApp } = await import('./lazy-vue-app.js');
+  cleanupVueApp();
   if (showPopoverDescriptor) {
     Object.defineProperty(HTMLElement.prototype, 'showPopover', showPopoverDescriptor);
   } else {
     delete HTMLElement.prototype.showPopover;
   }
+  vi.unstubAllGlobals();
 });
+
+function controlAnimationFrames() {
+  frameCallbacks = new Map();
+  vi.stubGlobal('requestAnimationFrame', callback => {
+    const id = ++frameId;
+    frameCallbacks.set(id, callback);
+    return id;
+  });
+  vi.stubGlobal('cancelAnimationFrame', id => frameCallbacks.delete(id));
+}
+
+async function flushPromotionFrame() {
+  await Promise.resolve(); // Run MutationObserver deliveries before the queued frame.
+  const callbacks = [...frameCallbacks.values()];
+  frameCallbacks.clear();
+  callbacks.forEach(callback => callback(0));
+  await Promise.resolve();
+}
 
 describe('loadVueApp idempotence', () => {
   it('loads and mounts once; second call is a no-op', async () => {
@@ -150,10 +176,12 @@ describe('loadVueApp idempotence', () => {
   it('falls back when showPopover is absent', async () => {
     delete HTMLElement.prototype.showPopover;
     document.documentElement.style.contain = 'layout';
+    const observe = vi.spyOn(MutationObserver.prototype, 'observe');
     const { loadVueApp } = await import('./lazy-vue-app.js');
 
     await loadVueApp(makeCore());
     expect(document.getElementById(HOST_ID).hasAttribute('popover')).toBe(false);
+    expect(observe).not.toHaveBeenCalled();
   });
 
   it('falls back to the ordinary host when entering the top layer throws', async () => {
@@ -163,6 +191,380 @@ describe('loadVueApp idempotence', () => {
 
     await loadVueApp(makeCore());
     expect(document.getElementById(HOST_ID).hasAttribute('popover')).toBe(false);
+  });
+});
+
+describe('dynamic root viewport promotion', () => {
+  it.each(['style', 'class'])(
+    'promotes the existing host once after a root %s change without remounting', async (change) => {
+      controlAnimationFrames();
+      const { createApp } = await import('vue');
+      const showPopover = vi.fn();
+      HTMLElement.prototype.showPopover = showPopover;
+      const root = document.documentElement;
+      const previousClass = root.getAttribute('class');
+      const previousStyle = root.getAttribute('style');
+      const preservedClass = 'preexisting-root-promotion-class';
+      root.classList.remove('needs-viewport-host');
+      root.classList.add(preservedClass);
+      const { loadVueApp, cleanupVueApp } = await import('./lazy-vue-app.js');
+      let style;
+      if (change === 'class') {
+        style = document.createElement('style');
+        style.dataset.testRootPromotion = 'true';
+        style.textContent = 'html.needs-viewport-host { transform: translateX(1px); }';
+        document.head.appendChild(style);
+      }
+      try {
+        await loadVueApp(makeCore());
+        const host = document.getElementById(HOST_ID);
+        expect(host.hasAttribute('popover')).toBe(false);
+        expect(showPopover).not.toHaveBeenCalled();
+
+        if (change === 'style') root.style.transform = 'translateX(1px)';
+        else root.classList.add('needs-viewport-host');
+        await Promise.resolve();
+        expect(frameCallbacks.size).toBe(1);
+        await flushPromotionFrame();
+
+        expect(host.getAttribute('popover')).toBe('manual');
+        expect(showPopover).toHaveBeenCalledOnce();
+        expect(createApp).toHaveBeenCalledOnce();
+        expect(createApp.mock.results[0].value.mount).toHaveBeenCalledOnce();
+
+        if (change === 'style') root.style.transform = 'none';
+        else root.classList.remove('needs-viewport-host');
+        root.dispatchEvent(new Event('resize'));
+        await Promise.resolve();
+        expect(frameCallbacks.size).toBe(0);
+        expect(showPopover).toHaveBeenCalledOnce();
+        expect(root.classList.contains(preservedClass)).toBe(true);
+        expect(root.classList.contains('needs-viewport-host')).toBe(false);
+      } finally {
+        cleanupVueApp();
+        style?.remove();
+        if (previousClass === null) root.removeAttribute('class');
+        else root.setAttribute('class', previousClass);
+        if (previousStyle === null) root.removeAttribute('style');
+        else root.setAttribute('style', previousStyle);
+      }
+    }
+  );
+
+  it.each(['insert', 'text', 'characterData'])(
+    'promotes after stylesheet %s mutation', async (edit) => {
+      controlAnimationFrames();
+      const showPopover = vi.fn();
+      HTMLElement.prototype.showPopover = showPopover;
+      let style;
+      let container;
+      if (edit === 'text') {
+        style = document.createElement('style');
+        style.dataset.testRootPromotion = 'true';
+        document.head.appendChild(style);
+      } else if (edit === 'characterData') {
+        style = document.createElement('style');
+        style.dataset.testRootPromotion = 'true';
+        style.textContent = 'html { filter: blur(1px); }';
+        document.head.appendChild(style);
+      }
+      const { loadVueApp } = await import('./lazy-vue-app.js');
+      try {
+        await loadVueApp(makeCore());
+        expect(document.getElementById(HOST_ID).hasAttribute('popover')).toBe(false);
+        if (edit === 'insert') {
+          container = document.createElement('div');
+          container.dataset.testRootPromotion = 'true';
+          style = document.createElement('style');
+          style.textContent = 'html { transform: translateX(1px); }';
+          container.appendChild(style);
+          document.head.appendChild(container);
+        } else if (edit === 'text') {
+          style.textContent = 'html { contain: layout; }';
+        } else if (edit === 'characterData') {
+          style.firstChild.data = 'html { contain: layout; }';
+        }
+        await Promise.resolve();
+        expect(frameCallbacks.size).toBe(1);
+        await flushPromotionFrame();
+        expect(showPopover, edit).toHaveBeenCalledOnce();
+        expect(document.getElementById(HOST_ID).getAttribute('popover')).toBe('manual');
+      } finally {
+        const { cleanupVueApp } = await import('./lazy-vue-app.js');
+        cleanupVueApp();
+        container?.remove();
+        style?.remove();
+      }
+    }
+  );
+
+  it.each(['media', 'disabled'])(
+    'queues one check for a stylesheet %s change without triggering unrelated root CSS', async (change) => {
+      controlAnimationFrames();
+      const showPopover = vi.fn();
+      HTMLElement.prototype.showPopover = showPopover;
+      const style = document.createElement('style');
+      style.dataset.testRootPromotion = 'true';
+      style.media = 'not all';
+      style.textContent = 'html.never-matches { contain: layout style; }';
+      document.head.appendChild(style);
+      const { loadVueApp } = await import('./lazy-vue-app.js');
+      await loadVueApp(makeCore());
+      expect(document.getElementById(HOST_ID).hasAttribute('popover')).toBe(false);
+
+      if (change === 'media') style.media = 'all';
+      else style.setAttribute('disabled', '');
+      await Promise.resolve();
+      expect(frameCallbacks.size).toBe(1);
+      await flushPromotionFrame();
+      expect(showPopover).not.toHaveBeenCalled();
+      expect(document.getElementById(HOST_ID).hasAttribute('popover')).toBe(false);
+      style.remove();
+    }
+  );
+
+  it('promotes when removing a stylesheet that masks a root containing block', async () => {
+    controlAnimationFrames();
+    const showPopover = vi.fn();
+    HTMLElement.prototype.showPopover = showPopover;
+    const base = document.createElement('style');
+    const overrideContainer = document.createElement('div');
+    const override = document.createElement('style');
+    base.dataset.testRootPromotion = 'true';
+    overrideContainer.dataset.testRootPromotion = 'true';
+    base.textContent = 'html { contain: layout style; }';
+    override.textContent = 'html { contain: none !important; }';
+    overrideContainer.appendChild(override);
+    document.head.append(base, overrideContainer);
+    const { loadVueApp, cleanupVueApp } = await import('./lazy-vue-app.js');
+    try {
+      expect(getComputedStyle(document.documentElement).contain).toBe('none');
+      await loadVueApp(makeCore());
+      const host = document.getElementById(HOST_ID);
+      expect(host.hasAttribute('popover')).toBe(false);
+      overrideContainer.remove();
+      await Promise.resolve();
+      expect(frameCallbacks.size).toBe(1);
+      await flushPromotionFrame();
+      expect(getComputedStyle(document.documentElement).contain).toBe('layout style');
+      expect(host.getAttribute('popover')).toBe('manual');
+      expect(showPopover).toHaveBeenCalledOnce();
+    } finally {
+      cleanupVueApp();
+      base.remove();
+      overrideContainer.remove();
+    }
+  });
+
+  it('observes stylesheet rel transitions into and out of the stylesheet relation', async () => {
+    controlAnimationFrames();
+    const showPopover = vi.fn();
+    HTMLElement.prototype.showPopover = showPopover;
+    const { loadVueApp } = await import('./lazy-vue-app.js');
+    await loadVueApp(makeCore());
+    const link = document.createElement('link');
+    link.dataset.testRootPromotion = 'true';
+    link.setAttribute('rel', 'alternate');
+    document.head.appendChild(link);
+    try {
+      await Promise.resolve();
+      expect(frameCallbacks.size).toBe(0);
+
+      link.setAttribute('rel', 'alternate Stylesheet');
+      await Promise.resolve();
+      expect(frameCallbacks.size).toBe(1);
+      await flushPromotionFrame();
+      expect(showPopover).not.toHaveBeenCalled();
+
+      link.setAttribute('rel', 'alternate');
+      await Promise.resolve();
+      expect(frameCallbacks.size).toBe(1);
+      await flushPromotionFrame();
+      expect(showPopover).not.toHaveBeenCalled();
+    } finally {
+      link.remove();
+    }
+  });
+
+  it.each(['href', 'media', 'disabled', 'load'])(
+    'schedules one root check for stylesheet link %s changes', async (change) => {
+      controlAnimationFrames();
+      const showPopover = vi.fn();
+      HTMLElement.prototype.showPopover = showPopover;
+      const { loadVueApp } = await import('./lazy-vue-app.js');
+      await loadVueApp(makeCore());
+      const link = document.createElement('link');
+      link.dataset.testRootPromotion = 'true';
+      link.rel = 'stylesheet';
+      document.head.appendChild(link);
+      await flushPromotionFrame();
+      frameCallbacks.clear();
+
+      if (change === 'href') link.setAttribute('href', 'data:text/css,html%7Bcontain%3Alayout%7D');
+      else if (change === 'media') link.setAttribute('media', 'screen');
+      else if (change === 'disabled') link.setAttribute('disabled', '');
+      else if (change === 'load') link.dispatchEvent(new Event('load'));
+
+      await Promise.resolve();
+      expect(frameCallbacks.size).toBe(1);
+      await flushPromotionFrame();
+      expect(showPopover).not.toHaveBeenCalled();
+      expect(document.getElementById(HOST_ID).hasAttribute('popover')).toBe(false);
+      link.remove();
+    }
+  );
+
+  it('ignores unrelated head mutations and non-stylesheet link changes without reading root style', async () => {
+    controlAnimationFrames();
+    const showPopover = vi.fn();
+    HTMLElement.prototype.showPopover = showPopover;
+    const { loadVueApp } = await import('./lazy-vue-app.js');
+    await loadVueApp(makeCore());
+    const getComputedStyleSpy = vi.spyOn(window, 'getComputedStyle');
+    getComputedStyleSpy.mockClear();
+    const noise = document.createElement('div');
+    noise.innerHTML = '<title>ignored</title><script>const x = 1</script><meta name="description" content="ignored"><span>text</span>';
+    const link = document.createElement('link');
+    link.rel = 'alternate';
+    try {
+      document.head.append(noise, link);
+      link.setAttribute('href', 'data:text/css,html%7Bcontain%3Alayout%7D');
+      link.setAttribute('media', 'screen');
+      link.setAttribute('disabled', '');
+      link.setAttribute('rel', 'icon');
+      noise.querySelector('title').textContent = 'changed title';
+      noise.querySelector('script').textContent = 'const y = 2';
+      noise.remove();
+      link.remove();
+
+      await Promise.resolve();
+      expect(frameCallbacks.size).toBe(0);
+      expect(getComputedStyleSpy).not.toHaveBeenCalled();
+      expect(showPopover).not.toHaveBeenCalled();
+    } finally {
+      getComputedStyleSpy.mockRestore();
+      noise.remove();
+      link.remove();
+    }
+  });
+
+  it('retries a throwing promotion only on a later external trigger', async () => {
+    controlAnimationFrames();
+    const showPopover = vi.fn()
+      .mockImplementationOnce(() => { throw new Error('transient failure'); })
+      .mockImplementation(() => {});
+    HTMLElement.prototype.showPopover = showPopover;
+    document.documentElement.style.contain = 'layout';
+    const { loadVueApp } = await import('./lazy-vue-app.js');
+    await loadVueApp(makeCore());
+    const host = document.getElementById(HOST_ID);
+    expect(showPopover).toHaveBeenCalledOnce();
+    expect(host.hasAttribute('popover')).toBe(false);
+    expect(frameCallbacks.size).toBe(0); // Removing our failed popover attribute does not self-trigger.
+
+    const stylesheet = document.createElement('style');
+    stylesheet.dataset.testRootPromotion = 'true';
+    document.head.appendChild(stylesheet);
+    await flushPromotionFrame();
+    expect(showPopover).toHaveBeenCalledTimes(2);
+    expect(host.getAttribute('popover')).toBe('manual');
+    expect(frameCallbacks.size).toBe(0);
+  });
+
+  it('cancels a queued frame during normal cleanup', async () => {
+    controlAnimationFrames();
+    const showPopover = vi.fn();
+    HTMLElement.prototype.showPopover = showPopover;
+    const { loadVueApp, cleanupVueApp } = await import('./lazy-vue-app.js');
+    await loadVueApp(makeCore());
+    const host = document.getElementById(HOST_ID);
+    document.documentElement.style.transform = 'translateX(1px)';
+    await Promise.resolve();
+    expect(frameCallbacks.size).toBe(1);
+
+    cleanupVueApp();
+    expect(frameCallbacks.size).toBe(0);
+    expect(host.isConnected).toBe(false);
+    await flushPromotionFrame();
+    expect(showPopover).not.toHaveBeenCalled();
+  });
+
+  it('clears promotion state and remounts when the promoted host was removed externally', async () => {
+    const showPopover = vi.fn();
+    HTMLElement.prototype.showPopover = showPopover;
+    document.documentElement.style.contain = 'layout';
+    const { loadVueApp, cleanupVueApp } = await import('./lazy-vue-app.js');
+    await loadVueApp(makeCore());
+    const oldHost = document.getElementById(HOST_ID);
+    oldHost.remove();
+    cleanupVueApp();
+
+    await loadVueApp(makeCore());
+    const newHost = document.getElementById(HOST_ID);
+    expect(newHost).not.toBe(oldHost);
+    expect(newHost.getAttribute('popover')).toBe('manual');
+    expect(showPopover).toHaveBeenCalledTimes(2);
+  });
+
+  it('removes the host and cancels its watcher when Vue unmount throws', async () => {
+    controlAnimationFrames();
+    const showPopover = vi.fn();
+    HTMLElement.prototype.showPopover = showPopover;
+    const { createApp } = await import('vue');
+    const { loadVueApp, cleanupVueApp } = await import('./lazy-vue-app.js');
+    await loadVueApp(makeCore());
+    const host = document.getElementById(HOST_ID);
+    createApp.mock.results[0].value.unmount.mockImplementation(() => { throw new Error('unmount failed'); });
+    document.documentElement.style.transform = 'translateX(1px)';
+    await Promise.resolve();
+    expect(frameCallbacks.size).toBe(1);
+
+    expect(() => cleanupVueApp()).not.toThrow();
+    expect(frameCallbacks.size).toBe(0);
+    expect(host.isConnected).toBe(false);
+    await flushPromotionFrame();
+    expect(showPopover).not.toHaveBeenCalled();
+  });
+
+  it('cancels pending checks and removes an orphaned host after failed mount cleanup', async () => {
+    controlAnimationFrames();
+    const { createApp } = await import('vue');
+    const showPopover = vi.fn();
+    HTMLElement.prototype.showPopover = showPopover;
+    const failedApp = { use: vi.fn(), mount: vi.fn(() => { throw new Error('mount failed'); }), unmount: vi.fn() };
+    createApp.mockImplementationOnce(() => failedApp);
+    const { loadVueApp, cleanupVueApp } = await import('./lazy-vue-app.js');
+    await expect(loadVueApp(makeCore())).rejects.toThrow('mount failed');
+    const host = document.getElementById(HOST_ID);
+    expect(host).not.toBeNull();
+
+    document.documentElement.style.transform = 'translateX(1px)';
+    await Promise.resolve();
+    expect(frameCallbacks.size).toBe(0); // Load failure stopped monitoring.
+    cleanupVueApp();
+    expect(host.isConnected).toBe(false);
+    expect(failedApp.unmount).toHaveBeenCalledOnce();
+    expect(showPopover).not.toHaveBeenCalled();
+  });
+
+  it('reinstalls monitoring on failed-mount retry and promotes the same host once', async () => {
+    controlAnimationFrames();
+    const { createApp } = await import('vue');
+    const showPopover = vi.fn();
+    HTMLElement.prototype.showPopover = showPopover;
+    const failedApp = { use: vi.fn(), mount: vi.fn(() => { throw new Error('mount failed'); }), unmount: vi.fn() };
+    createApp.mockImplementationOnce(() => failedApp);
+    const { loadVueApp } = await import('./lazy-vue-app.js');
+    await expect(loadVueApp(makeCore())).rejects.toThrow('mount failed');
+    const host = document.getElementById(HOST_ID);
+
+    document.documentElement.style.transform = 'translateX(1px)';
+    await loadVueApp(makeCore());
+    expect(document.getElementById(HOST_ID)).toBe(host);
+    expect(showPopover).toHaveBeenCalledOnce();
+    expect(createApp).toHaveBeenCalledTimes(2);
+    expect(createApp.mock.results[1].value.mount).toHaveBeenCalledOnce();
+    expect(frameCallbacks.size).toBe(0);
   });
 });
 
