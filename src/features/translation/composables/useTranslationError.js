@@ -152,29 +152,38 @@ export function useTranslationError(context = 'unknown') {
     currentError.value = null
     errorMessage.value = ''
     errorType.value = ''
+    errorTimestamp.value = null
     canRetry.value = false
     canOpenSettings.value = false
-    errorTimestamp.value = null
+    
+    logger.debug(`[${context}] Error state cleared`)
+  }
+  
+  /**
+   * Check if an error is retryable
+   * @param {Error|string} error - Error to check
+   * @returns {boolean} True if retryable
+   */
+  const isErrorRetryable = (error) => {
+    return isRetryableError(error)
   }
   
   /**
    * Get retry callback for current error
-   * @param {Function} retryFn - Function to retry the operation
+   * @param {Function} retryFunction - Function to call for retry
    * @returns {Function} Retry callback
    */
-  const getRetryCallback = (retryFn) => {
+  const getRetryCallback = (retryFunction) => {
     return async () => {
-      if (!canRetry.value) {
+      if (!canRetry.value || !retryFunction) {
         logger.warn(`[${context}] Retry attempted but not available`)
         return
       }
       
       try {
-        logger.info(`[${context}] Retrying translation after error: ${errorType.value}`)
-        clearError()
-        if (typeof retryFn === 'function') {
-          await retryFn()
-        }
+        logger.info(`[${context}] Retrying after error: ${errorType.value}`)
+        clearError() // Clear error before retry
+        await retryFunction()
       } catch (retryError) {
         logger.error(`[${context}] Retry failed:`, retryError)
         await handleError(retryError)
@@ -210,51 +219,75 @@ export function useTranslationError(context = 'unknown') {
     if (unsubscribeListener) return // Already setup
     
     const listener = (errorData) => {
-      if (errorData.context && errorData.context.includes(context)) {
-        logger.debug(`[${context}] Received UI error update:`, errorData)
-        currentError.value = errorData
-        errorMessage.value = errorData.message
-        errorType.value = errorData.type
-        errorTimestamp.value = errorData.timestamp
-        canRetry.value = errorData.canRetry || false
-        canOpenSettings.value = errorData.canOpenSettings || false
+      // Only handle errors for our context
+      if (errorData.context && !errorData.context.includes(context)) {
+        return
       }
+
+      logger.debug(`[${context}] Received UI error update:`, errorData)
+
+      const hasPublicEcho = typeof errorData.canRetry === 'boolean'
+      const publicError = hasPublicEcho
+        ? mapCanonicalTranslationError({ type: errorData.type })
+        : null
+
+      // Update error state from listener
+      currentError.value = errorData
+      errorMessage.value = errorData.message
+      errorType.value = errorData.type
+      errorTimestamp.value = errorData.timestamp
+
+      const strategy = getErrorDisplayStrategy(context, errorData.type)
+      canRetry.value = hasPublicEcho
+        ? errorData.canRetry
+        : shouldShowRetry(errorData.type, strategy)
+      canOpenSettings.value = hasPublicEcho
+        ? publicError.action === PublicTranslationErrorActions.OPEN_SETTINGS
+        : shouldShowSettings(errorData.type, strategy)
     }
     
     unsubscribeListener = errorHandler.addUIErrorListener(listener)
+    logger.debug(`[${context}] Error listener setup`)
   }
   
   /**
    * Cleanup error listener
    */
-  const cleanup = () => {
+  const cleanupErrorListener = () => {
     if (unsubscribeListener) {
       unsubscribeListener()
       unsubscribeListener = null
+      logger.debug(`[${context}] Error listener cleaned up`)
     }
   }
   
-  // Setup listener on composable creation
+  // Setup listener on creation
   setupErrorListener()
   
   // Cleanup on unmount
-  onUnmounted(cleanup)
+  onUnmounted(() => {
+    cleanupErrorListener()
+  })
   
   return {
-    // State
-    hasError,
+    // Error state
+    currentError,
     errorMessage: processedErrorMessage,
     errorType,
+    hasError,
     canRetry,
     canOpenSettings,
     errorTimestamp,
-    errorDisplayLevel,
     
     // Methods
     handleError,
     clearError,
+    isErrorRetryable,
     getRetryCallback,
     getSettingsCallback,
-    isRetryableError
+    
+    // Utils
+    setupErrorListener,
+    cleanupErrorListener
   }
 }
