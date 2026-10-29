@@ -10,6 +10,10 @@ const state = vi.hoisted(() => ({
   hadMediaDevices: false,
   bridgeInitialization: null,
   loggingResponse: null,
+  browserDescriptor: undefined,
+  browserStorage: null,
+  previousStorageOnChanged: undefined,
+  hadStorageOnChanged: false,
 }));
 
 class FakeAudio {
@@ -137,6 +141,17 @@ async function waitForBridgeInitialization(debugModeBridge) {
 
 beforeEach(() => {
   vi.useFakeTimers();
+  state.browserDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'browser');
+  state.browserStorage = globalThis.browser?.storage;
+  state.hadStorageOnChanged = Boolean(state.browserStorage && 'onChanged' in state.browserStorage);
+  state.previousStorageOnChanged = state.browserStorage?.onChanged;
+  if (state.browserStorage) {
+    const listeners = new Set();
+    state.browserStorage.onChanged = {
+      addListener: vi.fn((listener) => listeners.add(listener)),
+      removeListener: vi.fn((listener) => listeners.delete(listener)),
+    };
+  }
   state.messages = [];
   state.listener = null;
   state.audios = [];
@@ -150,6 +165,19 @@ beforeEach(() => {
 afterEach(async () => {
   vi.runOnlyPendingTimers();
   vi.useRealTimers();
+  if (state.browserDescriptor) {
+    Object.defineProperty(globalThis, 'browser', state.browserDescriptor);
+  } else {
+    delete globalThis.browser;
+  }
+  if (state.browserStorage) {
+    if (state.hadStorageOnChanged) {
+      state.browserStorage.onChanged = state.previousStorageOnChanged;
+    } else {
+      delete state.browserStorage.onChanged;
+    }
+  }
+  state.browserStorage = null;
   delete globalThis.chrome;
   delete globalThis.Audio;
   delete globalThis.SpeechSynthesisUtterance;
@@ -172,6 +200,8 @@ afterEach(async () => {
   setGlobalDebugOverride(false);
   setComponentLogLevel(LOG_COMPONENTS.LIVE_DUBBING, 1);
   safeConsole.setEnabled(false);
+  expect(Object.getOwnPropertyDescriptor(globalThis, 'browser')).toEqual(state.browserDescriptor);
+  state.browserDescriptor = undefined;
 });
 
 describe('offscreen TTS terminal playback lifecycle', () => {
